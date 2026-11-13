@@ -8,6 +8,7 @@ import android.graphics.Typeface
 import android.view.MotionEvent
 import com.dorlanpabon.ultimatewarriors.engine.FighterState
 import com.dorlanpabon.ultimatewarriors.engine.PlayerInput
+import java.util.concurrent.ConcurrentHashMap
 import kotlin.math.abs
 import kotlin.math.hypot
 
@@ -28,29 +29,35 @@ data class QuickPill(
     val color: Int
 )
 
-class TouchControls(private val fontUi: Typeface) {
+class TouchControls(private val fontUi: Typeface = Typeface.create("sans-serif", Typeface.BOLD)) {
     companion object {
         const val VW = 1080f
         const val VH = 1920f
         const val PAD_CX = 210f
         const val PAD_CY = 1655f
         const val PAD_RADIUS = 150f
+        private const val BUTTON_HIT_MULT = 1.38f
+        private const val PULSE_HOLD_MS = 145L
     }
+
+    private val cleanFont: Typeface = Typeface.create("sans-serif", Typeface.BOLD)
 
     val p1Input = PlayerInput()
     val p2Input = PlayerInput()
 
-    private val activePointers = mutableMapOf<Int, Pair<Float, Float>>() // pointerId -> (vx, vy)
-    private var p1StickPointerId: Int? = null
-    private var p1KnobX = PAD_CX
-    private var p1KnobY = PAD_CY
+    private val activePointers = ConcurrentHashMap<Int, Pair<Float, Float>>() // pointerId -> (vx, vy)
+    private val buttonPulses = ConcurrentHashMap<String, Long>() // buttonId -> expireMs
+    private val unconsumedPulses = ConcurrentHashMap.newKeySet<String>()
+    @Volatile private var p1StickPointerId: Int? = null
+    @Volatile private var p1KnobX = PAD_CX
+    @Volatile private var p1KnobY = PAD_CY
 
-    private var p2StickPointerId: Int? = null
+    @Volatile private var p2StickPointerId: Int? = null
     private val p2PadCx = 890f
     private val p2PadCy = 485f
     private val p2PadRadius = 85f
-    private var p2KnobX = p2PadCx
-    private var p2KnobY = p2PadCy
+    @Volatile private var p2KnobX = p2PadCx
+    @Volatile private var p2KnobY = p2PadCy
 
     private var lastLeftDown = false
     private var lastRightDown = false
@@ -97,6 +104,8 @@ class TouchControls(private val fontUi: Typeface) {
 
     fun resetAll() {
         activePointers.clear()
+        buttonPulses.clear()
+        unconsumedPulses.clear()
         p1StickPointerId = null
         p2StickPointerId = null
         p1KnobX = PAD_CX
@@ -122,10 +131,34 @@ class TouchControls(private val fontUi: Typeface) {
         inp.emote = false
     }
 
+    private fun triggerPulse(id: String, nowMs: Long) {
+        buttonPulses[id] = nowMs + PULSE_HOLD_MS
+        unconsumedPulses.add(id)
+    }
+
+    private fun isButtonActive(id: String, nowMs: Long): Boolean {
+        if (unconsumedPulses.contains(id)) return true
+        val exp = buttonPulses[id] ?: return false
+        return exp > nowMs
+    }
+
+    fun applyPulsesBeforeStep(local2P: Boolean) {
+        recomputeInputs(local2P)
+    }
+
+    fun consumeStepPulses() {
+        unconsumedPulses.clear()
+        val now = System.currentTimeMillis()
+        for ((k, exp) in buttonPulses) {
+            if (exp <= now) buttonPulses.remove(k, exp)
+        }
+    }
+
     fun onTouchEvent(event: MotionEvent, mapX: (Float) -> Float, mapY: (Float) -> Float, local2P: Boolean): Boolean {
         val action = event.actionMasked
         val idx = event.actionIndex
         val pointerId = event.getPointerId(idx)
+        val now = System.currentTimeMillis()
 
         when (action) {
             MotionEvent.ACTION_DOWN, MotionEvent.ACTION_POINTER_DOWN -> {
@@ -133,9 +166,10 @@ class TouchControls(private val fontUi: Typeface) {
                 val vy = mapY(event.getY(idx))
                 activePointers[pointerId] = vx to vy
 
-                // Check quick pills on down
+                // Check quick pills on down with generous vertical padding
                 for (pill in quickPills) {
-                    if (pill.rect.contains(vx, vy)) {
+                    val hitRect = RectF(pill.rect).apply { inset(-6f, -14f) }
+                    if (hitRect.contains(vx, vy)) {
                         when (pill.id) {
                             "q_tx" -> p1Input.quickTransformNext = true
                             "q_p4" -> p1Input.quickTransformPhase4 = true
@@ -147,18 +181,42 @@ class TouchControls(private val fontUi: Typeface) {
                         }
                     }
                 }
+
+                // Trigger closest P1 action button if touched (expanded hit radius)
+                var bestBtn: TouchButton? = null
+                var bestDist = Float.MAX_VALUE
+                for (btn in p1Buttons) {
+                    val d = hypot(vx - btn.cx, vy - btn.cy)
+                    if (d <= btn.radius * BUTTON_HIT_MULT && d < bestDist) {
+                        bestDist = d
+                        bestBtn = btn
+                    }
+                }
+                bestBtn?.let { triggerPulse(it.id, now) }
+
                 if (local2P) {
+                    var bestP2: TouchButton? = null
+                    var bestP2Dist = Float.MAX_VALUE
                     for (btn in p2Buttons) {
-                        if (btn.id == "p2_trans" && hypot(vx - btn.cx, vy - btn.cy) <= btn.radius * 1.2f) {
+                        val d = hypot(vx - btn.cx, vy - btn.cy)
+                        if (d <= btn.radius * BUTTON_HIT_MULT && d < bestP2Dist) {
+                            bestP2Dist = d
+                            bestP2 = btn
+                        }
+                    }
+                    bestP2?.let { btn ->
+                        if (btn.id == "p2_trans") {
                             if (p2Input.charge) p2Input.quickBackBase = true else p2Input.quickTransformNext = true
+                        } else {
+                            triggerPulse(btn.id, now)
                         }
                     }
                 }
 
-                // Assign D-Pad stick pointer if near pad
-                if (p1StickPointerId == null && hypot(vx - PAD_CX, vy - PAD_CY) <= PAD_RADIUS * 1.45f) {
+                // Assign D-Pad stick pointer if near pad and did not hit a button
+                if (bestBtn == null && p1StickPointerId == null && hypot(vx - PAD_CX, vy - PAD_CY) <= PAD_RADIUS * 1.55f) {
                     p1StickPointerId = pointerId
-                } else if (local2P && p2StickPointerId == null && hypot(vx - p2PadCx, vy - p2PadCy) <= p2PadRadius * 1.45f) {
+                } else if (local2P && p2StickPointerId == null && hypot(vx - p2PadCx, vy - p2PadCy) <= p2PadRadius * 1.55f) {
                     p2StickPointerId = pointerId
                 }
             }
@@ -171,16 +229,24 @@ class TouchControls(private val fontUi: Typeface) {
             }
 
             MotionEvent.ACTION_UP, MotionEvent.ACTION_POINTER_UP, MotionEvent.ACTION_CANCEL -> {
-                activePointers.remove(pointerId)
-                if (p1StickPointerId == pointerId) {
+                if (action == MotionEvent.ACTION_CANCEL) {
+                    activePointers.clear()
                     p1StickPointerId = null
-                    p1KnobX = PAD_CX
-                    p1KnobY = PAD_CY
-                }
-                if (p2StickPointerId == pointerId) {
                     p2StickPointerId = null
-                    p2KnobX = p2PadCx
-                    p2KnobY = p2PadCy
+                    p1KnobX = PAD_CX; p1KnobY = PAD_CY
+                    p2KnobX = p2PadCx; p2KnobY = p2PadCy
+                } else {
+                    activePointers.remove(pointerId)
+                    if (p1StickPointerId == pointerId) {
+                        p1StickPointerId = null
+                        p1KnobX = PAD_CX
+                        p1KnobY = PAD_CY
+                    }
+                    if (p2StickPointerId == pointerId) {
+                        p2StickPointerId = null
+                        p2KnobX = p2PadCx
+                        p2KnobY = p2PadCy
+                    }
                 }
             }
         }
@@ -207,7 +273,7 @@ class TouchControls(private val fontUi: Typeface) {
                     p1KnobX = sx
                     p1KnobY = sy
                 }
-                val dead = 26f
+                val dead = 24f
                 if (dx < -dead) p1Input.left = true
                 if (dx > dead) p1Input.right = true
                 if (dy < -dead * 1.15f) p1Input.up = true
@@ -227,11 +293,12 @@ class TouchControls(private val fontUi: Typeface) {
         lastLeftDown = p1Input.left
         lastRightDown = p1Input.right
 
-        // P1 Action Buttons
-        for ((_, pos) in activePointers) {
+        // P1 Action Buttons (held pointers OR latched tap pulses)
+        for ((pid, pos) in activePointers) {
+            if (pid == p1StickPointerId || pid == p2StickPointerId) continue
             val (px, py) = pos
             for (btn in p1Buttons) {
-                if (hypot(px - btn.cx, py - btn.cy) <= btn.radius * 1.18f) {
+                if (hypot(px - btn.cx, py - btn.cy) <= btn.radius * BUTTON_HIT_MULT) {
                     when (btn.id) {
                         "punch" -> p1Input.punch = true
                         "kick" -> p1Input.kick = true
@@ -243,8 +310,14 @@ class TouchControls(private val fontUi: Typeface) {
                 }
             }
         }
+        if (isButtonActive("punch", now)) p1Input.punch = true
+        if (isButtonActive("kick", now)) p1Input.kick = true
+        if (isButtonActive("shot", now)) p1Input.shot = true
+        if (isButtonActive("charge", now)) p1Input.charge = true
+        if (isButtonActive("tackle", now)) p1Input.tackle = true
+        if (isButtonActive("emote", now)) p1Input.emote = true
 
-        // Optional Local 2P split controls (inverted top controls)
+        // Optional Local 2P split controls
         if (local2P) {
             p2StickPointerId?.let { sid ->
                 activePointers[sid]?.let { (sx, sy) ->
@@ -260,17 +333,17 @@ class TouchControls(private val fontUi: Typeface) {
                         p2KnobY = sy
                     }
                     val dead = 18f
-                    // Inverted top pad for facing-each-other play on table, or natural X
                     if (dx < -dead) p2Input.left = true
                     if (dx > dead) p2Input.right = true
                     if (dy < -dead) p2Input.up = true
                     if (dy > dead) p2Input.down = true
                 }
             }
-            for ((_, pos) in activePointers) {
+            for ((pid, pos) in activePointers) {
+                if (pid == p1StickPointerId || pid == p2StickPointerId) continue
                 val (px, py) = pos
                 for (btn in p2Buttons) {
-                    if (hypot(px - btn.cx, py - btn.cy) <= btn.radius * 1.2f) {
+                    if (hypot(px - btn.cx, py - btn.cy) <= btn.radius * BUTTON_HIT_MULT) {
                         when (btn.id) {
                             "p2_punch" -> p2Input.punch = true
                             "p2_kick" -> p2Input.kick = true
@@ -281,6 +354,11 @@ class TouchControls(private val fontUi: Typeface) {
                     }
                 }
             }
+            if (isButtonActive("p2_punch", now)) p2Input.punch = true
+            if (isButtonActive("p2_kick", now)) p2Input.kick = true
+            if (isButtonActive("p2_shot", now)) p2Input.shot = true
+            if (isButtonActive("p2_charge", now)) p2Input.charge = true
+            if (isButtonActive("p2_tackle", now)) p2Input.tackle = true
         }
     }
 
@@ -319,10 +397,17 @@ class TouchControls(private val fontUi: Typeface) {
             strokePaint.strokeWidth = 2.5f
             canvas.drawRoundRect(pill.rect, 14f, 14f, strokePaint)
 
-            textPaint.typeface = fontUi
-            textPaint.textSize = 22f
+            textPaint.typeface = cleanFont
+            var sz = 21f
+            textPaint.textSize = sz
+            val maxW = pill.rect.width() - 14f
+            val measured = textPaint.measureText(label)
+            if (measured > maxW && measured > 0f) {
+                sz *= maxW / measured
+                textPaint.textSize = sz.coerceAtLeast(14f)
+            }
             textPaint.color = if (enabled) Color.WHITE else Color.argb(120, 200, 210, 225)
-            canvas.drawText(label, pill.rect.centerX(), pill.rect.centerY() + 8f, textPaint)
+            canvas.drawText(label, pill.rect.centerX(), pill.rect.centerY() + sz * 0.35f, textPaint)
         }
 
         // P1 D-Pad base
@@ -352,8 +437,9 @@ class TouchControls(private val fontUi: Typeface) {
         canvas.drawCircle(p1KnobX, p1KnobY, 56f, strokePaint)
 
         // P1 Action Buttons
+        val nowMs = System.currentTimeMillis()
         for (btn in p1Buttons) {
-            val pressed = when (btn.id) {
+            val held = when (btn.id) {
                 "punch" -> p1Input.punch
                 "kick" -> p1Input.kick
                 "shot" -> p1Input.shot
@@ -362,6 +448,7 @@ class TouchControls(private val fontUi: Typeface) {
                 "emote" -> p1Input.emote
                 else -> false
             }
+            val pressed = held || isButtonActive(btn.id, nowMs)
             val lbl = when (btn.id) {
                 "punch" -> if (isSpanish) "GOLPE" else "HIT"
                 "kick" -> if (isSpanish) "PATADA" else "KICK"
@@ -377,8 +464,15 @@ class TouchControls(private val fontUi: Typeface) {
             strokePaint.strokeWidth = if (pressed) 5f else 3f
             canvas.drawCircle(btn.cx, btn.cy, btn.radius, strokePaint)
 
-            textPaint.typeface = fontUi
-            textPaint.textSize = if (btn.radius >= 64f) 24f else 20f
+            textPaint.typeface = cleanFont
+            var lblSize = if (btn.radius >= 64f) 24f else 20f
+            textPaint.textSize = lblSize
+            val maxBtnW = btn.radius * 1.72f
+            val m = textPaint.measureText(lbl)
+            if (m > maxBtnW && m > 0f) {
+                lblSize *= maxBtnW / m
+                textPaint.textSize = lblSize.coerceAtLeast(13f)
+            }
             textPaint.color = if (pressed) btn.color else Color.WHITE
             canvas.drawText(lbl, btn.cx, btn.cy + 4f, textPaint)
             textPaint.textSize = 18f
@@ -396,14 +490,15 @@ class TouchControls(private val fontUi: Typeface) {
             canvas.drawCircle(p2KnobX, p2KnobY, 32f, bgPaint)
 
             for (btn in p2Buttons) {
-                bgPaint.color = Color.argb(180, Color.red(btn.color), Color.green(btn.color), Color.blue(btn.color))
+                val p2Pressed = isButtonActive(btn.id, nowMs)
+                bgPaint.color = if (p2Pressed) Color.WHITE else Color.argb(180, Color.red(btn.color), Color.green(btn.color), Color.blue(btn.color))
                 canvas.drawCircle(btn.cx, btn.cy, btn.radius, bgPaint)
                 strokePaint.color = Color.WHITE
-                strokePaint.strokeWidth = 2f
+                strokePaint.strokeWidth = if (p2Pressed) 4f else 2f
                 canvas.drawCircle(btn.cx, btn.cy, btn.radius, strokePaint)
-                textPaint.typeface = fontUi
+                textPaint.typeface = cleanFont
                 textPaint.textSize = 22f
-                textPaint.color = Color.WHITE
+                textPaint.color = if (p2Pressed) btn.color else Color.WHITE
                 canvas.drawText(btn.label, btn.cx, btn.cy + 8f, textPaint)
             }
         }

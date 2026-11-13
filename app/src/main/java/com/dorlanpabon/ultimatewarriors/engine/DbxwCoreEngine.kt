@@ -95,7 +95,8 @@ data class KiBlast(
     val angleDeg: Double,
     val width: Double = 46.0,
     val height: Double = 24.0,
-    var alive: Boolean = true
+    var alive: Boolean = true,
+    val ownerAssetDir: String? = null
 )
 
 data class ExplosionEffect(
@@ -240,6 +241,7 @@ class FighterState(
     var dy: Double = 0.0
     var width: Double = DbxwCoreEngine.BASE_WIDTH
     var height: Double = DbxwCoreEngine.BASE_HEIGHT
+    var fixedAttackLeft: Double = Double.NaN
 
     // Visual orientation: 1 = facing right, -1 = facing left
     var facing: Int = if (playerIndex == 1) 1 else -1
@@ -269,6 +271,7 @@ class FighterState(
     var damagedTimer: Double = 0.0
 
     var comboCount: Int = 0
+    var comboScore: Long = 0L
     var hitCounterCooldown: Double = 0.0
     var dmgAccum: Double = 0.0
     var scoreLive: Double = 0.0
@@ -315,14 +318,21 @@ class FighterState(
         }
     }
 
+    fun baseWidth(): Double = when {
+        cheats.ssfp && phaseFolder == "ssfp" -> 161.4063
+        cheats.hasUpDim(capForm) -> 124.7244
+        else -> DbxwCoreEngine.BASE_WIDTH
+    }
+
     fun updateDimensions() {
+        fixedAttackLeft = Double.NaN
         when {
             cheats.ssfp && phaseFolder == "ssfp" -> {
                 width = 161.4063
                 height = 149.7323
             }
             cheats.hasUpDim(capForm) -> {
-                width = 118.9356
+                width = 124.7244
                 height = 147.48
             }
             else -> {
@@ -332,6 +342,39 @@ class FighterState(
         }
         val g = groundY()
         if (y > g) y = g
+    }
+
+    /** Ported from BattleEngine.fixAttackWidth for fixj / fixk extended sprites */
+    fun fixAttackWidth(isPunch: Boolean, isKick: Boolean) {
+        val needsFix = (isPunch && cheats.fixJ) || (isKick && cheats.fixK)
+        if (!needsFix) return
+        if (fixedAttackLeft.isNaN()) {
+            fixedAttackLeft = x
+        }
+        when {
+            cheats.hasUpDim(capForm) -> {
+                x = fixedAttackLeft
+                width = 150.0
+            }
+            cheats.ssfp && phaseFolder == "ssfp" -> {
+                x = fixedAttackLeft - 10.0
+                width = 190.0
+            }
+            else -> {
+                x = fixedAttackLeft - 22.0
+                width = 144.0
+            }
+        }
+    }
+
+    /** Ported from BattleEngine.restoreAttackWidth */
+    fun restoreAttackWidth() {
+        if (!cheats.fixJ && !cheats.fixK) return
+        if (!fixedAttackLeft.isNaN()) {
+            x = fixedAttackLeft
+            fixedAttackLeft = Double.NaN
+        }
+        width = baseWidth()
     }
 
     fun lifeRatio(): Double = (lifeSave / lifeMax).coerceIn(0.0, 1.0)
@@ -373,14 +416,30 @@ class FighterState(
         return frames[animFrameIndex % frames.size]
     }
 
-    /** Hitbox rect in world coordinates (x, y, w, h) */
-    fun hurtbox(): DoubleArray = doubleArrayOf(x + width * 0.16, y + height * 0.08, width * 0.68, height * 0.88)
+    fun currentPhaseAssetDir(): String? {
+        val p = currentSpritePath() ?: return null
+        return if (p.contains('/')) p.substringBeforeLast('/') else null
+    }
 
-    /** Strike hitbox extending in facing direction */
-    fun attackHitbox(): DoubleArray {
-        val reach = if (isPressK) width * 0.68 else width * 0.56
-        val hx = if (facing >= 0) x + width * 0.55 else x + width * 0.45 - reach
-        return doubleArrayOf(hx, y + height * 0.16, reach, height * 0.65)
+    /** Hurtbox rect in world coordinates (x, y, w, h) */
+    fun hurtbox(): DoubleArray {
+        val sx = width / DbxwCoreEngine.BASE_WIDTH
+        val inset = 15.0 * sx
+        return doubleArrayOf(x + inset, y + height * 0.06, width - inset * 2.0, height * 0.90)
+    }
+
+    /** Strike hitbox extending in facing direction (rotates vertically up to +/-25deg toward opponent) */
+    fun attackHitbox(opp: FighterState? = null): DoubleArray {
+        val reach = if (isPressK) max(58.0, width * 0.66) else max(52.0, width * 0.58)
+        val hx = if (facing >= 0) x + width * 0.48 else x + width * 0.52 - reach
+        var hy = y + height * 0.14
+        if (opp != null) {
+            val myCy = y + height * 0.5
+            val oppCy = opp.y + opp.height * 0.5
+            val dy = (oppCy - myCy).coerceIn(-height * 0.35, height * 0.35)
+            hy += dy * 0.45
+        }
+        return doubleArrayOf(hx, hy, reach, height * 0.68)
     }
 }
 
@@ -442,6 +501,7 @@ class DbxwCoreEngine(
     var elapsedTime: Double = 0.0
 
     var flashTimer: Double = 0.0
+    var hitPauseTimer: Double = 0.0
     var backgroundScrollX: Double = 0.0
     var koBannerTimer: Double = 0.0
     var matchFinished: Boolean = false
@@ -479,6 +539,9 @@ class DbxwCoreEngine(
         p1.moving = true
         p1.canAttack = true
         p1.comboCount = 0
+        p1.comboScore = 0L
+        p1.fixedAttackLeft = Double.NaN
+        p1.updateDimensions()
 
         p2.x = 680.0
         p2.y = p2.groundY()
@@ -495,10 +558,14 @@ class DbxwCoreEngine(
         p2.moving = true
         p2.canAttack = true
         p2.comboCount = 0
+        p2.comboScore = 0L
+        p2.fixedAttackLeft = Double.NaN
+        p2.updateDimensions()
 
         blasts.clear()
         explosions.clear()
         clashActive = false
+        hitPauseTimer = 0.0
         roundTimeRemaining = settings.gameTime.toDoubleOrNull() ?: -1.0
         sound.onFight()
     }
@@ -517,6 +584,7 @@ class DbxwCoreEngine(
         }
 
         if (flashTimer > 0.0) flashTimer = max(0.0, flashTimer - dt)
+        if (hitPauseTimer > 0.0) hitPauseTimer = max(0.0, hitPauseTimer - dt)
 
         // Countdown timer pauses during TimeJump
         val anyTimeJump = p1.timeJumpActive || p2.timeJumpActive
@@ -598,12 +666,13 @@ class DbxwCoreEngine(
 
         // Knockback deceleration (ManageCriticalState)
         if (f.isCritic) {
+            val decel = 380.0 * dt
             if (f.dx > 0) {
-                f.dx = max(0.0, f.dx - 15.0 * (dt * 60.0))
+                f.dx = max(0.0, f.dx - decel)
             } else if (f.dx < 0) {
-                f.dx = min(0.0, f.dx + 15.0 * (dt * 60.0))
+                f.dx = min(0.0, f.dx + decel)
             }
-            if (abs(f.dx) < 1.0) {
+            if (abs(f.dx) < 8.0) {
                 f.dx = 0.0
                 f.isCritic = false
                 f.moving = true
@@ -728,21 +797,25 @@ class DbxwCoreEngine(
             }
         }
 
-        // Combat & Movement Priority (mirrors dbxwCore Gameplay)
+        // Combat & Movement Priority (mirrors dbxwCore Gameplay + BattleEngine fixAttackWidth)
         val animName: String
         var animInterval = f.standAnim
 
         when {
-            f.damagedFlag -> {
-                animName = "damaged"
-                animInterval = 0.08
-            }
             f.isCovering -> {
-                f.dx = 0.0
+                f.restoreAttackWidth()
+                if (!f.isCritic) f.dx = 0.0
                 animName = "coverup"
                 animInterval = 0.1
             }
+            f.damagedFlag -> {
+                f.restoreAttackWidth()
+                if (!f.isCritic) f.dx = 0.0
+                animName = "damaged"
+                animInterval = max(0.06, opp.attackAnim)
+            }
             input.charge && !f.isCovering && f.chargeWidth < MAX_CHARGE && !input.punch && !input.kick && f.canAttack && !f.cheats.android -> {
+                f.restoreAttackWidth()
                 f.isCharging = true
                 f.moving = false
                 f.dx = 0.0
@@ -753,12 +826,14 @@ class DbxwCoreEngine(
                 animInterval = f.auraAnim
             }
             input.emote && hasAnim(f, "taunt") && f.canAttack && !f.isJumping -> {
+                f.restoreAttackWidth()
                 f.dx = 0.0
                 f.moving = false
                 animName = "taunt"
                 animInterval = f.tauntAnim
             }
             input.shot && hasAnim(f, "power") && f.chargeWidth >= 50.0 && !input.charge && f.canAttack && !f.cheats.hasNoShot(f.capForm) -> {
+                f.restoreAttackWidth()
                 f.isShooting = true
                 f.dx = 0.0
                 f.moving = false
@@ -766,25 +841,30 @@ class DbxwCoreEngine(
                 animName = "power"
                 animInterval = 0.15
             }
-            input.punch && !input.kick && f.canAttack -> {
+            input.punch && f.canAttack -> {
                 f.isAttacking = true
                 f.isPressJ = true
+                f.fixAttackWidth(isPunch = true, isKick = false)
                 f.moving = false
-                f.dx = 0.0
+                val holdingTowardOpp = (f.facing > 0 && input.right) || (f.facing < 0 && input.left)
+                f.dx = if (holdingTowardOpp && abs(f.x - opp.x) > 52.0) f.facing * f.speed * 0.35 else 0.0
                 performMeleeStrike(f, opp, isKick = false)
-                animName = if (f.cheats.fixJ && hasAnim(f, "kick")) "kick" else "punch"
+                animName = if (hasAnim(f, "punch")) "punch" else "kick"
                 animInterval = f.attackAnim
             }
-            input.kick && !input.punch && f.canAttack -> {
+            input.kick && f.canAttack -> {
                 f.isAttacking = true
                 f.isPressK = true
+                f.fixAttackWidth(isPunch = false, isKick = true)
                 f.moving = false
-                f.dx = 0.0
+                val holdingTowardOpp = (f.facing > 0 && input.right) || (f.facing < 0 && input.left)
+                f.dx = if (holdingTowardOpp && abs(f.x - opp.x) > 56.0) f.facing * f.speed * 0.35 else 0.0
                 performMeleeStrike(f, opp, isKick = true)
-                animName = if (f.cheats.fixK && hasAnim(f, "punch")) "punch" else "kick"
+                animName = if (hasAnim(f, "kick")) "kick" else "punch"
                 animInterval = f.attackAnim
             }
             input.left && f.moving -> {
+                f.restoreAttackWidth()
                 f.dx = -f.speed
                 if (settings.movementInBackground) {
                     backgroundScrollX -= f.speed * 0.08 * dt
@@ -797,6 +877,7 @@ class DbxwCoreEngine(
                 animInterval = 0.08
             }
             input.right && f.moving -> {
+                f.restoreAttackWidth()
                 f.dx = f.speed
                 if (settings.movementInBackground) {
                     backgroundScrollX += f.speed * 0.08 * dt
@@ -809,13 +890,16 @@ class DbxwCoreEngine(
                 animInterval = 0.08
             }
             else -> {
+                f.restoreAttackWidth()
                 if (!f.isCritic) f.dx = 0.0
                 animName = if (f.isJumping) {
                     if (f.dy < 0) "up" else "down"
+                } else if ((opp.isPressJ || opp.isPressK) && !f.isDodging && rectsIntersect(opp.attackHitbox(f), f.hurtbox())) {
+                    "damaged"
                 } else {
                     "stand"
                 }
-                animInterval = f.standAnim
+                animInterval = if (animName == "damaged") max(0.06, opp.attackAnim) else f.standAnim
             }
         }
 
@@ -828,12 +912,13 @@ class DbxwCoreEngine(
     }
 
     private fun applyGravityAndBounds(f: FighterState, dt: Double) {
+        val effDt = if (hitPauseTimer > 0.0 && (f.damagedFlag || f.isAttacking)) 0.0 else dt
         val g = f.groundY()
         if (f.y < g || f.dy < 0.0) {
-            f.dy += GRAVITY * dt
+            f.dy += GRAVITY * effDt
         }
-        f.x += f.dx * dt
-        f.y += f.dy * dt
+        f.x += f.dx * effDt
+        f.y += f.dy * effDt
 
         if (f.y >= g) {
             f.y = g
@@ -1093,15 +1178,27 @@ class DbxwCoreEngine(
 
     private fun performMeleeStrike(attacker: FighterState, defender: FighterState, isKick: Boolean) {
         if (attacker.attackCooldown > 0.0) return
-        val interval = max(0.14, attacker.attackAnim * 2.5)
+        val interval = max(0.125, attacker.attackAnim * 2.25)
         attacker.attackCooldown = interval
 
-        val hitRect = attacker.attackHitbox()
+        val hitRect = attacker.attackHitbox(defender)
         val hurtRect = defender.hurtbox()
         if (!rectsIntersect(hitRect, hurtRect)) return
 
         val mult = if (isKick) 1.2 else 1.0
-        applyDamage(attacker, defender, normalMultiplier = mult, coveredMultiplier = 1.0, defenceMultiplier = 1.0, applyKnockback = true)
+        val contactX = (max(hitRect[0], hurtRect[0]) + min(hitRect[0] + hitRect[2], hurtRect[0] + hurtRect[2])) * 0.5
+        val contactY = (max(hitRect[1], hurtRect[1]) + min(hitRect[1] + hitRect[3], hurtRect[1] + hurtRect[3])) * 0.5
+        applyDamage(
+            attacker = attacker,
+            defender = defender,
+            normalMultiplier = mult,
+            coveredMultiplier = 1.0,
+            defenceMultiplier = 1.0,
+            applyKnockback = true,
+            isKick = isKick,
+            contactX = contactX,
+            contactY = contactY
+        )
     }
 
     private fun checkAutoDodge(attacker: FighterState, defender: FighterState): Boolean {
@@ -1154,7 +1251,10 @@ class DbxwCoreEngine(
         normalMultiplier: Double,
         coveredMultiplier: Double,
         defenceMultiplier: Double,
-        applyKnockback: Boolean
+        applyKnockback: Boolean,
+        isKick: Boolean = false,
+        contactX: Double = defender.x + defender.width * 0.5,
+        contactY: Double = defender.y + defender.height * 0.45
     ) {
         if (defender.lifeSave <= 0.0) return
         if (!defender.isCovering && checkAutoDodge(attacker, defender)) {
@@ -1166,6 +1266,7 @@ class DbxwCoreEngine(
             defender.lifeSave = max(0.0, defender.lifeSave - dmgCover)
             addScore(attacker, defender, dmgCover)
             addCharge(attacker, 2.0)
+            spawnEffect(contactX, contactY, "hit")
             sound.onBlock()
         } else {
             attacker.comboCount += 1
@@ -1175,11 +1276,12 @@ class DbxwCoreEngine(
             defender.lifeSave = max(0.0, defender.lifeSave - dmg)
             addScore(attacker, defender, dmg)
             addCharge(attacker, 5.0)
-            sound.onPunch()
+            if (isKick) sound.onStrongKick() else sound.onPunch()
+            hitPauseTimer = if (isKick) 0.026 else 0.016
 
             defender.damagedFlag = true
             defender.damagedTimer = elapsedTime
-            spawnEffect(defender.x + defender.width * 0.5, defender.y + defender.height * 0.45, "hit")
+            spawnEffect(contactX, contactY, "hit")
 
             // Ultra Ego passive: gain +10% damage when hit, revert if <15% HP
             val defCheatForm = abs(defender.capForm - (defender.def.maxForm + 1.0)) < 0.01
@@ -1196,11 +1298,11 @@ class DbxwCoreEngine(
                     defender.cheats.recoilless ||
                     attacker.timeJumpActive
                 if (!immune) {
-                    val kbX = 50.0 + sqrt(attacker.comboCount.toDouble()) * 10.0
-                    val kbY = 30.0 + sqrt(attacker.comboCount.toDouble()) * 8.0
+                    val kbX = 135.0 + sqrt(attacker.comboCount.toDouble()) * 28.0
+                    val kbY = 120.0 + sqrt(attacker.comboCount.toDouble()) * 18.0
                     val dir = if (attacker.x <= defender.x) 1.0 else -1.0
                     defender.dx = dir * kbX
-                    defender.dy = -kbY * 1.2
+                    defender.dy = -kbY * 1.15
                     defender.isCritic = true
                     defender.moving = false
                     defender.isJumping = true
@@ -1215,6 +1317,7 @@ class DbxwCoreEngine(
         val pts = round(norm * 100.0) * 10.0 // Round(NormalizedDamage, 2) * 1000
         attacker.dmgAccum += pts
         attacker.scoreLive += pts
+        attacker.comboScore += pts.toLong()
     }
 
     private fun tryFireKiBlast(f: FighterState, opp: FighterState) {
@@ -1239,7 +1342,7 @@ class DbxwCoreEngine(
         }
         val angle = atan2(dyB, dxB) * (180.0 / PI)
 
-        blasts.add(KiBlast(nextEntityId++, f.playerIndex, bx, by, dxB, dyB, angle))
+        blasts.add(KiBlast(nextEntityId++, f.playerIndex, bx, by, dxB, dyB, angle, ownerAssetDir = f.currentPhaseAssetDir()))
         addCharge(f, -50.0)
         sound.onKiShot()
     }
@@ -1448,6 +1551,7 @@ class DbxwCoreEngine(
                 f.hitCounterCooldown -= dt
                 if (f.hitCounterCooldown <= 0.0) {
                     f.comboCount = 0
+                    f.comboScore = 0L
                 }
             }
 
@@ -1588,7 +1692,7 @@ class DbxwCoreEngine(
                 dyB = 0.0
             }
             val angle = atan2(dyB, dxB) * (180.0 / PI)
-            blasts.add(KiBlast(nextEntityId++, f.playerIndex, bx, by, dxB, dyB, angle))
+            blasts.add(KiBlast(nextEntityId++, f.playerIndex, bx, by, dxB, dyB, angle, ownerAssetDir = f.currentPhaseAssetDir()))
         }
         sound.onKiShot()
     }

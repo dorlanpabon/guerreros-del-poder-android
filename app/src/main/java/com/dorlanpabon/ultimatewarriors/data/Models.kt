@@ -25,20 +25,20 @@ data class CharStats(
     val tauntSpeed: Double,
     val auraSpeed: Double
 ) {
-    /** Exact VBA formula from Slide21: if Attack Speed <= 1 -> use direct, else 0.06 / (attackSpeed / 10) */
+    /** Speed interval in seconds: if <= 1 use directly, else stat * 0.01 (matches GameAssets.java & Attack Speed) */
     fun resolvedAttackAnimInterval(): Double {
-        return if (attackSpeed <= 1.0) attackSpeed.coerceAtLeast(0.04)
-        else (0.06 / (attackSpeed / 10.0)).coerceAtLeast(0.05)
+        return if (attackSpeed <= 1.0) attackSpeed.coerceAtLeast(0.05)
+        else (attackSpeed * 0.01).coerceIn(0.055, 0.16)
     }
 
     fun resolvedStandAnimInterval(): Double {
         return if (standSpeed <= 1.0) standSpeed.coerceAtLeast(0.05)
-        else (0.96 / standSpeed).coerceIn(0.05, 0.25)
+        else (standSpeed * 0.01).coerceIn(0.06, 0.22)
     }
 
     fun resolvedTauntAnimInterval(): Double {
         return if (tauntSpeed <= 1.0) tauntSpeed.coerceAtLeast(0.05)
-        else (0.96 / tauntSpeed).coerceIn(0.05, 0.25)
+        else (tauntSpeed * 0.01).coerceIn(0.06, 0.22)
     }
 
     fun resolvedAuraAnimInterval(): Double {

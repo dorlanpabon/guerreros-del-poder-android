@@ -98,6 +98,15 @@ class TikTokLiveManager(
     var tikFinityPort: Int = 21213
     var webhookPort: Int = 8765
 
+    // Direct On-Phone WebView TikTok Live Listener state
+    @Volatile var directUsername: String = ""
+    @Volatile var directPhoneEnabled: Boolean = false
+    @Volatile var directPhoneConnected: Boolean = false
+    @Volatile var directStatusText: String = "Sin configurar"
+    var onRequestPhoneConnectDialog: (() -> Unit)? = null
+    var onStartDirectPhoneListener: ((String) -> Unit)? = null
+    var onStopDirectPhoneListener: (() -> Unit)? = null
+
     @Volatile var webhookRunning: Boolean = false
         private set
     @Volatile var tikFinityConnected: Boolean = false
@@ -199,6 +208,33 @@ class TikTokLiveManager(
         tikFinityThread = thread(start = true, isDaemon = true, name = "UW-TikFinityWS") {
             runTikFinityLoop()
         }
+    }
+
+    fun stopTikFinityClient() {
+        tikFinityEnabled = false
+        tikFinityConnected = false
+        tikFinityThread = null
+    }
+
+    fun requestPhoneConnectDialog() {
+        onRequestPhoneConnectDialog?.invoke()
+    }
+
+    fun startDirectPhoneConnection(rawUser: String) {
+        val cleaned = rawUser.trim().trimStart('@').trim()
+        if (cleaned.isEmpty()) return
+        directUsername = "@$cleaned"
+        directPhoneEnabled = true
+        directPhoneConnected = false
+        directStatusText = "Conectando a @$cleaned..."
+        onStartDirectPhoneListener?.invoke(cleaned)
+    }
+
+    fun stopDirectPhoneConnection() {
+        directPhoneEnabled = false
+        directPhoneConnected = false
+        directStatusText = "Desconectado"
+        onStopDirectPhoneListener?.invoke()
     }
 
     fun getLocalIpAddress(): String {

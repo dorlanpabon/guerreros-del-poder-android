@@ -33,6 +33,7 @@ import com.dorlanpabon.ultimatewarriors.tiktok.TikTokGiftKind
 import com.dorlanpabon.ultimatewarriors.tiktok.TikTokLiveManager
 import com.dorlanpabon.ultimatewarriors.tiktok.TikTokPlayStyle
 import com.dorlanpabon.ultimatewarriors.tiktok.SimulatorIntensity
+import java.util.concurrent.ConcurrentLinkedQueue
 import kotlin.concurrent.thread
 import kotlin.math.abs
 import kotlin.math.max
@@ -91,27 +92,36 @@ class GameSurfaceView(
     private var paused = false
     private var victoryRecorded = false
 
-    private val touchControls = TouchControls(repo.fontSuperSquad)
-    private val tiktok = TikTokLiveManager(repo.characters, repo.stages)
+    private val touchControls = TouchControls(repo.fontSansBold)
+    val tiktok = TikTokLiveManager(repo.characters, repo.stages)
     private var liveRematchTimer = 0.0
     private var liveNextMatchup: Triple<CharDefinition, CharDefinition, StageDefinition>? = null
     private var liveQuickTargetTeam = 1
+    private var tiktokHelpVisible = false
 
     private var currentFps = 60
     private var fpsFrameCount = 0
     private var fpsTimer = 0.0
 
-    // Clickable hit regions rebuilt each draw frame
-    private val clickTargets = mutableListOf<Pair<RectF, () -> Unit>>()
+    // Thread-safe clickable hit regions rebuilt each draw frame and published atomically
+    private var buildingTargets = ArrayList<Pair<RectF, () -> Unit>>()
+    @Volatile private var publishedTargets: List<Pair<RectF, () -> Unit>> = emptyList()
+    private val uiCommandQueue = ConcurrentLinkedQueue<() -> Unit>()
     private var touchDownY = 0f
+    private var touchStartX = 0f
     private var touchStartY = 0f
     private var touchMoved = false
+    private var touchConsumedDown = false
 
     // Paints
     private val fillPaint = Paint(Paint.ANTI_ALIAS_FLAG)
     private val strokePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { style = Paint.Style.STROKE }
     private val textPaint = Paint(Paint.ANTI_ALIAS_FLAG)
     private val bmpPaint = Paint(Paint.ANTI_ALIAS_FLAG or Paint.FILTER_BITMAP_FLAG)
+    private val pixelPaint = Paint().apply {
+        isFilterBitmap = false
+        isDither = false
+    }
     private val glowPaint = Paint(Paint.ANTI_ALIAS_FLAG)
     private val shadowPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = Color.argb(115, 0, 0, 0) }
     private val dstRect = RectF()
@@ -173,7 +183,15 @@ class GameSurfaceView(
                 goToScreen(ScreenState.CHAR_SELECT)
                 true
             }
-            ScreenState.TIKTOK_HUB, ScreenState.STORY_SELECT, ScreenState.SETTINGS, ScreenState.CREDITS, ScreenState.VICTORY -> {
+            ScreenState.TIKTOK_HUB -> {
+                if (tiktokHelpVisible) {
+                    tiktokHelpVisible = false
+                } else {
+                    goToScreen(ScreenState.MAIN_MENU)
+                }
+                true
+            }
+            ScreenState.STORY_SELECT, ScreenState.SETTINGS, ScreenState.CREDITS, ScreenState.VICTORY -> {
                 goToScreen(ScreenState.MAIN_MENU)
                 true
             }
@@ -268,6 +286,10 @@ class GameSurfaceView(
     }
 
     private fun update(dt: Double) {
+        while (true) {
+            val cmd = uiCommandQueue.poll() ?: break
+            cmd()
+        }
         menuAnimTimer += dt
         if (menuAnimTimer >= 0.1) {
             menuAnimTimer = 0.0
@@ -295,9 +317,11 @@ class GameSurfaceView(
                     }
                     val steps = if (matchMode == MatchMode.BOT_VS_BOT) botSpeedMultiplier else 1
                     repeat(steps) {
+                        touchControls.applyPulsesBeforeStep(matchMode == MatchMode.LOCAL_2P)
                         val in1 = botP1?.computeInput(eng.p1, eng.p2, eng, dt) ?: touchControls.p1Input
                         val in2 = botP2?.computeInput(eng.p2, eng.p1, eng, dt) ?: touchControls.p2Input
                         eng.step(dt, in1, in2)
+                        touchControls.consumeStepPulses()
                     }
                     if (eng.matchFinished) {
                         if (!victoryRecorded) {
@@ -331,6 +355,10 @@ class GameSurfaceView(
         }
     }
 
+    private fun registerClick(rect: RectF, pad: Float = 12f, action: () -> Unit) {
+        buildingTargets.add(RectF(rect.left - pad, rect.top - pad, rect.right + pad, rect.bottom + pad) to action)
+    }
+
     private fun drawFrame(canvas: Canvas) {
         val cw = width.toFloat().coerceAtLeast(1f)
         val ch = height.toFloat().coerceAtLeast(1f)
@@ -338,7 +366,7 @@ class GameSurfaceView(
         canvas.save()
         canvas.scale(cw / VW, ch / VH)
 
-        clickTargets.clear()
+        buildingTargets = ArrayList(48)
 
         when (screen) {
             ScreenState.SPLASH -> drawSplash(canvas)
@@ -354,24 +382,43 @@ class GameSurfaceView(
             ScreenState.TIKTOK_HUB -> drawTikTokHub(canvas)
         }
 
+        publishedTargets = buildingTargets
         canvas.restore()
     }
 
     private fun mapTouchX(rawX: Float): Float = rawX * (VW / width.toFloat().coerceAtLeast(1f))
     private fun mapTouchY(rawY: Float): Float = rawY * (VH / height.toFloat().coerceAtLeast(1f))
 
+    private fun dispatchHit(targets: List<Pair<RectF, () -> Unit>>, vx: Float, vy: Float): Boolean {
+        for (i in targets.indices.reversed()) {
+            val (rect, action) = targets[i]
+            if (rect.contains(vx, vy)) {
+                uiCommandQueue.offer(action)
+                return true
+            }
+        }
+        return false
+    }
+
     override fun onTouchEvent(event: MotionEvent): Boolean {
         val vx = mapTouchX(event.x)
         val vy = mapTouchY(event.y)
+        val targets = publishedTargets
 
-        if (screen == ScreenState.FIGHT && !paused) {
-            if (event.actionMasked == MotionEvent.ACTION_DOWN) {
-                for (i in clickTargets.indices.reversed()) {
-                    val (rect, action) = clickTargets[i]
-                    if (rect.contains(vx, vy)) {
-                        action()
-                        return true
-                    }
+        if (screen == ScreenState.FIGHT) {
+            if (paused) {
+                if (event.actionMasked == MotionEvent.ACTION_DOWN || event.actionMasked == MotionEvent.ACTION_POINTER_DOWN) {
+                    val idx = event.actionIndex
+                    dispatchHit(targets, mapTouchX(event.getX(idx)), mapTouchY(event.getY(idx)))
+                }
+                return true
+            }
+            if (event.actionMasked == MotionEvent.ACTION_DOWN || event.actionMasked == MotionEvent.ACTION_POINTER_DOWN) {
+                val idx = event.actionIndex
+                val px = mapTouchX(event.getX(idx))
+                val py = mapTouchY(event.getY(idx))
+                if (dispatchHit(targets, px, py)) {
+                    return true
                 }
             }
             val controlsActive = matchMode != MatchMode.BOT_VS_BOT &&
@@ -385,31 +432,48 @@ class GameSurfaceView(
         when (event.actionMasked) {
             MotionEvent.ACTION_DOWN -> {
                 touchDownY = vy
+                touchStartX = vx
                 touchStartY = vy
                 touchMoved = false
+                touchConsumedDown = false
+
+                val immediateDown = tiktokHelpVisible || verifyChar != null || when (screen) {
+                    ScreenState.SPLASH, ScreenState.MAIN_MENU, ScreenState.LOADING,
+                    ScreenState.VICTORY, ScreenState.CREDITS, ScreenState.TIKTOK_HUB -> true
+                    ScreenState.SETTINGS -> vy < 275f || vy > 1700f
+                    ScreenState.STORY_SELECT, ScreenState.STAGE_SELECT -> vy < 140f || vy > 1700f
+                    ScreenState.CHAR_SELECT -> vy < 500f || vy > 1540f
+                    else -> false
+                }
+                if (immediateDown && dispatchHit(targets, vx, vy)) {
+                    touchConsumedDown = true
+                    return true
+                }
             }
             MotionEvent.ACTION_MOVE -> {
                 val dy = vy - touchDownY
-                if (abs(vy - touchStartY) > 18f) touchMoved = true
+                if (abs(vy - touchStartY) > 50f) touchMoved = true
                 touchDownY = vy
-                when (screen) {
-                    ScreenState.CHAR_SELECT -> if (verifyChar == null) charScrollY = (charScrollY - dy).coerceIn(0f, 950f)
-                    ScreenState.STAGE_SELECT -> stageScrollY = (stageScrollY - dy).coerceIn(0f, 650f)
-                    ScreenState.STORY_SELECT -> storyScrollY = (storyScrollY - dy).coerceIn(0f, 1100f)
-                    ScreenState.SETTINGS -> settingsScrollY = (settingsScrollY - dy).coerceIn(0f, 900f)
-                    else -> {}
+                if (!touchConsumedDown && verifyChar == null && !tiktokHelpVisible) {
+                    when (screen) {
+                        ScreenState.CHAR_SELECT -> charScrollY = (charScrollY - dy).coerceIn(0f, 950f)
+                        ScreenState.STAGE_SELECT -> stageScrollY = (stageScrollY - dy).coerceIn(0f, 650f)
+                        ScreenState.STORY_SELECT -> storyScrollY = (storyScrollY - dy).coerceIn(0f, 1100f)
+                        ScreenState.SETTINGS -> settingsScrollY = (settingsScrollY - dy).coerceIn(0f, 900f)
+                        else -> {}
+                    }
                 }
             }
             MotionEvent.ACTION_UP -> {
-                if (!touchMoved) {
-                    for (i in clickTargets.indices.reversed()) {
-                        val (rect, action) = clickTargets[i]
-                        if (rect.contains(vx, vy)) {
-                            action()
-                            return true
-                        }
+                if (!touchConsumedDown && !touchMoved) {
+                    if (!dispatchHit(targets, vx, vy)) {
+                        dispatchHit(targets, touchStartX, touchStartY)
                     }
                 }
+                touchConsumedDown = false
+            }
+            MotionEvent.ACTION_CANCEL -> {
+                touchConsumedDown = false
             }
         }
         return true
@@ -450,6 +514,33 @@ class GameSurfaceView(
         }
     }
 
+    private fun drawFitText(
+        canvas: Canvas,
+        text: String,
+        x: Float,
+        y: Float,
+        maxWidth: Float,
+        maxSize: Float,
+        minSize: Float = 16f,
+        align: Paint.Align = Paint.Align.CENTER,
+        color: Int = Color.WHITE,
+        typeface: Typeface = repo.fontSansBold,
+        shadow: Boolean = true
+    ) {
+        textPaint.typeface = typeface
+        textPaint.textAlign = align
+        textPaint.color = color
+        var sz = maxSize
+        textPaint.textSize = sz
+        while (sz > minSize && textPaint.measureText(text) > maxWidth) {
+            sz -= 1.5f
+            textPaint.textSize = sz
+        }
+        if (shadow) textPaint.setShadowLayer(4f, 2f, 2f, Color.BLACK)
+        canvas.drawText(text, x, y, textPaint)
+        if (shadow) textPaint.clearShadowLayer()
+    }
+
     private fun drawButton(
         canvas: Canvas,
         rect: RectF,
@@ -465,14 +556,40 @@ class GameSurfaceView(
         strokePaint.strokeWidth = 3.5f
         canvas.drawRoundRect(rect, 22f, 22f, strokePaint)
 
-        textPaint.typeface = repo.fontSuperSquad
-        textPaint.textSize = textSize
-        textPaint.textAlign = Paint.Align.CENTER
-        textPaint.color = Color.WHITE
-        textPaint.setShadowLayer(4f, 2f, 2f, Color.BLACK)
-        canvas.drawText(text, rect.centerX(), rect.centerY() + textSize * 0.34f, textPaint)
-        textPaint.clearShadowLayer()
-        clickTargets.add(rect to onClick)
+        val lines = text.split('\n')
+        if (lines.size <= 1) {
+            drawFitText(
+                canvas,
+                text,
+                rect.centerX(),
+                rect.centerY() + textSize * 0.34f,
+                maxWidth = rect.width() - 28f,
+                maxSize = textSize,
+                minSize = 18f,
+                align = Paint.Align.CENTER,
+                color = Color.WHITE,
+                typeface = repo.fontSansBold
+            )
+        } else {
+            val lineH = textSize * 1.18f
+            val firstY = rect.centerY() - (lines.size - 1) * lineH * 0.5f + textSize * 0.34f
+            lines.forEachIndexed { idx, line ->
+                val sz = if (idx == 0) textSize else (textSize * 0.86f).coerceAtLeast(18f)
+                drawFitText(
+                    canvas,
+                    line,
+                    rect.centerX(),
+                    firstY + idx * lineH,
+                    maxWidth = rect.width() - 28f,
+                    maxSize = sz,
+                    minSize = 16f,
+                    align = Paint.Align.CENTER,
+                    color = if (idx == 0) Color.WHITE else Color.rgb(230, 238, 255),
+                    typeface = repo.fontSansBold
+                )
+            }
+        }
+        registerClick(rect, pad = 10f, onClick)
     }
 
     private fun drawHeaderTitle(canvas: Canvas, title: String) {
@@ -504,12 +621,17 @@ class GameSurfaceView(
         textPaint.color = Color.rgb(255, 205, 50)
         canvas.drawText("ULTIMATE WARRIORS", VW * 0.5f, 1300f, textPaint)
 
-        textPaint.typeface = repo.fontSuperSquad
-        textPaint.textSize = 32f
-        textPaint.color = Color.argb(200, 180, 210, 255)
-        canvas.drawText("elJulioDev — Mobile Vertical Edition", VW * 0.5f, 1370f, textPaint)
+        drawFitText(
+            canvas,
+            "dorlanpabon — Mobile Vertical Edition",
+            VW * 0.5f,
+            1370f,
+            maxWidth = VW - 80f,
+            maxSize = 32f,
+            color = Color.argb(220, 180, 210, 255)
+        )
 
-        clickTargets.add(RectF(0f, 0f, VW, VH) to { goToScreen(ScreenState.MAIN_MENU) })
+        registerClick(RectF(0f, 0f, VW, VH), pad = 0f) { goToScreen(ScreenState.MAIN_MENU) }
     }
 
     private fun drawMainMenu(canvas: Canvas) {
@@ -598,24 +720,33 @@ class GameSurfaceView(
                 drawFitBitmap(canvas, repo.getBitmap(p1?.ico), RectF(card.left + 16f, card.top + 22f, card.left + 150f, card.bottom - 22f))
                 drawFitBitmap(canvas, repo.getBitmap(p2?.ico), RectF(card.right - 150f, card.top + 22f, card.right - 16f, card.bottom - 22f))
 
-                textPaint.typeface = repo.fontSuperSquad
-                textPaint.textSize = 32f
-                textPaint.textAlign = Paint.Align.CENTER
-                textPaint.color = Color.WHITE
-                canvas.drawText(if (repo.isSpanish()) ch.titleEs else ch.titleEn, card.centerX(), card.top + 72f, textPaint)
+                drawFitText(
+                    canvas,
+                    if (repo.isSpanish()) ch.titleEs else ch.titleEn,
+                    card.centerX(),
+                    card.top + 72f,
+                    maxWidth = card.width() - 340f,
+                    maxSize = 32f,
+                    color = Color.WHITE
+                )
 
-                textPaint.typeface = Typeface.DEFAULT_BOLD
-                textPaint.textSize = 26f
-                textPaint.color = Color.rgb(175, 210, 255)
                 val diffStr = when (ch.botDifficulty) {
                     1 -> if (repo.isSpanish()) "Dificultad: Normal" else "Difficulty: Normal"
                     3 -> if (repo.isSpanish()) "Dificultad: Extrema" else "Difficulty: Extreme"
                     else -> if (repo.isSpanish()) "Dificultad: Alta" else "Difficulty: Hard"
                 }
-                canvas.drawText("${st?.name ?: ch.stageFolder}  •  $diffStr", card.centerX(), card.top + 128f, textPaint)
+                drawFitText(
+                    canvas,
+                    "${st?.name ?: ch.stageFolder}  •  $diffStr",
+                    card.centerX(),
+                    card.top + 128f,
+                    maxWidth = card.width() - 340f,
+                    maxSize = 25f,
+                    color = Color.rgb(175, 210, 255)
+                )
 
                 if (card.top >= listTop - 40f && card.bottom <= listBottom + 40f) {
-                    clickTargets.add(RectF(card) to {
+                    registerClick(card, pad = 6f) {
                         activeStoryChapter = ch
                         matchMode = MatchMode.STORY
                         botDifficulty = ch.botDifficulty
@@ -623,7 +754,7 @@ class GameSurfaceView(
                         p2Char = p2 ?: repo.characters.last()
                         selectedStage = st ?: repo.stages.first()
                         goToScreen(ScreenState.LOADING)
-                    })
+                    }
                 }
             }
             y += 205f
@@ -700,10 +831,10 @@ class GameSurfaceView(
                 verifyChar = ch
                 verifyPhasePreviewIndex = 0
             }
-            clickTargets.add(RectF(box.left, box.top, box.right, box.bottom - 50f) to {
+            registerClick(RectF(box.left, box.top, box.right, box.bottom - 52f), pad = 4f) {
                 sound.playCursorCharaSel()
                 pickingSlot = slot
-            })
+            }
         }
 
         drawPreviewCard(1, p1Char, RectF(32f, 232f, 524f, 600f), Color.rgb(70, 175, 255))
@@ -751,7 +882,7 @@ class GameSurfaceView(
                 canvas.drawText(ch.name.take(12), r.centerX(), r.bottom - 14f, textPaint)
 
                 if (r.top >= gridTop - 25f && r.bottom <= gridBottom + 25f && verifyChar == null) {
-                    clickTargets.add(RectF(r) to {
+                    registerClick(r, pad = 6f) {
                         sound.playDecideCharaSel()
                         if (pickingSlot == 1) {
                             p1Char = ch
@@ -760,7 +891,7 @@ class GameSurfaceView(
                             p2Char = ch
                             pickingSlot = 1
                         }
-                    })
+                    }
                 }
             }
         }
@@ -811,10 +942,15 @@ class GameSurfaceView(
         val path = frames?.getOrNull(charPreviewFrame % frames.size) ?: ch.ico
         drawFitBitmap(canvas, repo.getBitmap(path), RectF(modal.centerX() - 180f, modal.top + 120f, modal.centerX() + 180f, modal.top + 520f))
 
-        textPaint.typeface = repo.fontSuperSquad
-        textPaint.textSize = 34f
-        textPaint.color = Color.CYAN
-        canvas.drawText("${if (repo.isSpanish()) "FASE" else "FORM"}: ${curPhaseRaw.uppercase()} (${(verifyPhasePreviewIndex % allPhases.size) + 1}/${allPhases.size})", modal.centerX(), modal.top + 565f, textPaint)
+        drawFitText(
+            canvas,
+            "${if (repo.isSpanish()) "FASE" else "FORM"}: ${curPhaseRaw.uppercase()} (${(verifyPhasePreviewIndex % allPhases.size) + 1}/${allPhases.size})",
+            modal.centerX(),
+            modal.top + 565f,
+            maxWidth = modal.width() - 60f,
+            maxSize = 32f,
+            color = Color.CYAN
+        )
 
         drawButton(canvas, RectF(modal.left + 60f, modal.top + 595f, modal.right - 60f, modal.top + 675f), if (repo.isSpanish()) "Ver Siguiente Fase" else "Next Form", Color.rgb(45, 110, 195), textSize = 30f) {
             sound.playCursor()
@@ -904,10 +1040,10 @@ class GameSurfaceView(
                 canvas.drawText(st.name.take(18), r.centerX(), r.bottom - 15f, textPaint)
 
                 if (r.top >= gridTop - 25f && r.bottom <= gridBottom + 25f) {
-                    clickTargets.add(RectF(r) to {
+                    registerClick(r, pad = 6f) {
                         sound.playDecideCharaSel()
                         selectedStage = st
-                    })
+                    }
                 }
             }
         }
@@ -954,9 +1090,15 @@ class GameSurfaceView(
         strokePaint.strokeWidth = 3f
         canvas.drawRoundRect(barBg, 20f, 20f, strokePaint)
 
-        textPaint.typeface = repo.fontSuperSquad
-        textPaint.textSize = 36f
-        canvas.drawText("${(loadingProgress * 100).toInt()}%", VW * 0.5f, 1245f, textPaint)
+        drawFitText(
+            canvas,
+            "${(loadingProgress * 100).toInt()}%",
+            VW * 0.5f,
+            1245f,
+            maxWidth = 300f,
+            maxSize = 36f,
+            color = Color.WHITE
+        )
     }
 
     private fun drawFight(canvas: Canvas) {
@@ -1044,19 +1186,20 @@ class GameSurfaceView(
         drawFighter(canvas, eng.p1, scaleX, scaleY, isFrozen = eng.p2.timeJumpActive)
         drawFighter(canvas, eng.p2, scaleX, scaleY, isFrozen = eng.p1.timeJumpActive)
 
-        // Ki Blasts
-        val blastBmp = repo.getBitmap("data/resources/GameEffects/blast.png")
+        // Ki Blasts (prefer character-phase custom blast.png, fallback to default blast)
+        val defaultBlastBmp = repo.getBitmap("data/resources/GameEffects/blast.png")
         for (b in eng.blasts) {
+            val blastBmp = b.ownerAssetDir?.let { repo.getBitmap("$it/blast.png") } ?: defaultBlastBmp
             val cx = (b.x + b.width * 0.5).toFloat() * scaleX
             val cy = ARENA_TOP + (b.y + b.height * 0.5).toFloat() * scaleY
-            val bw = b.width.toFloat() * scaleX * 1.25f
-            val bh = b.height.toFloat() * scaleY * 1.25f
+            val bw = b.width.toFloat() * scaleX * 1.45f
+            val bh = b.height.toFloat() * scaleY * 1.45f
             canvas.save()
             canvas.translate(cx, cy)
             canvas.rotate(b.angleDeg.toFloat())
             if (blastBmp != null) {
                 dstRect.set(-bw * 0.5f, -bh * 0.5f, bw * 0.5f, bh * 0.5f)
-                canvas.drawBitmap(blastBmp, null, dstRect, bmpPaint)
+                canvas.drawBitmap(blastBmp, null, dstRect, pixelPaint)
             } else {
                 fillPaint.color = Color.YELLOW
                 canvas.drawOval(-bw * 0.5f, -bh * 0.5f, bw * 0.5f, bh * 0.5f, fillPaint)
@@ -1072,9 +1215,9 @@ class GameSurfaceView(
             if (bmp != null) {
                 val cx = ex.x.toFloat() * scaleX
                 val cy = ARENA_TOP + ex.y.toFloat() * scaleY
-                val rad = if (ex.kind == "hit") 78f else 120f
+                val rad = if (ex.kind == "hit") 108f else 132f
                 dstRect.set(cx - rad, cy - rad, cx + rad, cy + rad)
-                canvas.drawBitmap(bmp, null, dstRect, bmpPaint)
+                canvas.drawBitmap(bmp, null, dstRect, pixelPaint)
             }
         }
 
@@ -1083,6 +1226,7 @@ class GameSurfaceView(
             strokePaint.strokeWidth = 3f
             strokePaint.color = Color.GREEN
             for (f in listOf(eng.p1, eng.p2)) {
+                val opp = if (f === eng.p1) eng.p2 else eng.p1
                 val hb = f.hurtbox()
                 canvas.drawRect(
                     hb[0].toFloat() * scaleX,
@@ -1093,7 +1237,7 @@ class GameSurfaceView(
                 )
                 if (f.isAttacking) {
                     strokePaint.color = Color.RED
-                    val ab = f.attackHitbox()
+                    val ab = f.attackHitbox(opp)
                     canvas.drawRect(
                         ab[0].toFloat() * scaleX,
                         ARENA_TOP + ab[1].toFloat() * scaleY,
@@ -1102,6 +1246,42 @@ class GameSurfaceView(
                         strokePaint
                     )
                     strokePaint.color = Color.GREEN
+                }
+            }
+        }
+
+        // Arena Combo Banners
+        val es = repo.isSpanish()
+        for (f in listOf(eng.p1, eng.p2)) {
+            if (f.comboCount > 1) {
+                val isP1 = f.playerIndex == 1
+                val bx = if (isP1) 175f else VW - 175f
+                val by = ARENA_TOP + 88f
+                val pill = RectF(bx - 145f, by - 46f, bx + 145f, by + 36f)
+                fillPaint.color = Color.argb(195, 16, 20, 36)
+                canvas.drawRoundRect(pill, 16f, 16f, fillPaint)
+                strokePaint.color = if (isP1) Color.rgb(65, 195, 255) else Color.rgb(255, 95, 80)
+                strokePaint.strokeWidth = 3f
+                canvas.drawRoundRect(pill, 16f, 16f, strokePaint)
+                drawFitText(
+                    canvas,
+                    if (es) "${f.comboCount} GOLPES!" else "${f.comboCount} HITS!",
+                    bx,
+                    by - 4f,
+                    maxWidth = 260f,
+                    maxSize = 32f,
+                    color = Color.rgb(255, 190, 45)
+                )
+                if (f.comboScore > 0) {
+                    drawFitText(
+                        canvas,
+                        "+${f.comboScore}",
+                        bx,
+                        by + 25f,
+                        maxWidth = 260f,
+                        maxSize = 22f,
+                        color = Color.WHITE
+                    )
                 }
             }
         }
@@ -1140,31 +1320,34 @@ class GameSurfaceView(
     }
 
     private fun drawFighterShadow(canvas: Canvas, f: FighterState, scaleX: Float, scaleY: Float) {
-        val groundScreenY = ARENA_TOP + (f.groundY() + f.height).toFloat() * scaleY - 8f
-        val cx = (f.x + f.width * 0.5).toFloat() * scaleX
+        val baseW = f.baseWidth()
+        val groundScreenY = ARENA_TOP + (f.groundY() + f.height).toFloat() * scaleY - 6f
+        val cx = (f.x + if (f.facing > 0) baseW * 0.5 else f.width - baseW * 0.5).toFloat() * scaleX
         val heightAboveGround = max(0.0, f.groundY() - f.y)
         val factor = (1.0 - heightAboveGround / 300.0).coerceIn(0.35, 1.0).toFloat()
-        val rx = (f.width * 0.42 * factor).toFloat() * scaleX
+        val rx = (baseW * 0.45 * factor).toFloat() * scaleX
         val ry = 14f * factor
         canvas.drawOval(cx - rx, groundScreenY - ry, cx + rx, groundScreenY + ry, shadowPaint)
     }
 
     private fun drawFighter(canvas: Canvas, f: FighterState, scaleX: Float, scaleY: Float, isFrozen: Boolean) {
-        val left = f.x.toFloat() * scaleX
-        val top = ARENA_TOP + f.y.toFloat() * scaleY
-        val w = f.width.toFloat() * scaleX
-        val h = f.height.toFloat() * scaleY
-        val box = RectF(left, top, left + w, top + h)
+        val spriteScale = 1.66f
+        val drawH = f.height.toFloat() * spriteScale
+        val drawBottom = ARENA_TOP + (f.y + f.height).toFloat() * scaleY
+        val drawTop = drawBottom - drawH
+        val baseScreenW = f.baseWidth().toFloat() * scaleX
+        val bodyCX = (f.x + if (f.facing > 0) f.baseWidth() * 0.5 else f.width - f.baseWidth() * 0.5).toFloat() * scaleX
+        val box = RectF(bodyCX - baseScreenW * 0.5f, drawTop, bodyCX + baseScreenW * 0.5f, drawBottom)
 
         // Charging smoke & blizzard
         if (f.isCharging && repo.settings.loadingEffects) {
             val smokeFrames = repo.gameEffectsFrames["smoke_ground"]
             val smokePath = smokeFrames?.getOrNull(f.smokeFrameIndex % smokeFrames.size)
-            drawFitBitmap(canvas, repo.getBitmap(smokePath), RectF(box.left - 35f, box.bottom - 55f, box.right + 35f, box.bottom + 20f))
+            drawFitBitmap(canvas, repo.getBitmap(smokePath), RectF(box.left - 35f, box.bottom - 55f, box.right + 35f, box.bottom + 20f), paint = pixelPaint)
 
             val blizFrames = repo.gameEffectsFrames["blizzard"]
             val blizPath = blizFrames?.getOrNull(f.blizzardFrameIndex % blizFrames.size)
-            drawFitBitmap(canvas, repo.getBitmap(blizPath), RectF(box.left - 45f, box.top - 40f, box.right + 45f, box.bottom + 25f))
+            drawFitBitmap(canvas, repo.getBitmap(blizPath), RectF(box.left - 45f, box.top - 40f, box.right + 45f, box.bottom + 25f), paint = pixelPaint)
         }
 
         // Transformation / Kaioken / TimeJump Glow
@@ -1184,18 +1367,34 @@ class GameSurfaceView(
                 val fxFrames = repo.charEffectsFrames[effectKey]
                 val fxPath = fxFrames?.getOrNull(f.effectFrameIndex % fxFrames.size)
                 val fxBmp = if (isFrozen) repo.getGrayscaleBitmap(fxPath) else repo.getBitmap(fxPath)
-                drawFitBitmap(canvas, fxBmp, RectF(box.left - 28f, box.top - 32f, box.right + 28f, box.bottom + 16f))
+                drawFitBitmap(canvas, fxBmp, RectF(box.left - 28f, box.top - 32f, box.right + 28f, box.bottom + 16f), paint = pixelPaint)
             }
         }
 
-        // Character Sprite
+        // Character Sprite (foot-anchored constant height so melee punches/kicks extend without vertical shrinking)
         val spritePath = f.currentSpritePath()
         val bmp = if (isFrozen) {
             repo.getGrayscaleBitmap(spritePath) ?: repo.getBitmap(spritePath)
         } else {
             repo.getBitmap(spritePath)
         }
-        drawFitBitmap(canvas, bmp, box, flipX = (f.facing < 0))
+        if (bmp != null && bmp.height > 0) {
+            val aspect = bmp.width.toFloat() / bmp.height.toFloat()
+            val drawW = drawH * aspect
+            val spriteRect = if (f.isAttacking) {
+                val standHalfW = drawH * 0.44f
+                if (f.facing > 0) {
+                    val sLeft = bodyCX - standHalfW
+                    RectF(sLeft, drawTop, sLeft + drawW, drawBottom)
+                } else {
+                    val sRight = bodyCX + standHalfW
+                    RectF(sRight - drawW, drawTop, sRight, drawBottom)
+                }
+            } else {
+                RectF(bodyCX - drawW * 0.5f, drawTop, bodyCX + drawW * 0.5f, drawBottom)
+            }
+            drawFitBitmap(canvas, bmp, spriteRect, flipX = (f.facing < 0), paint = pixelPaint)
+        }
     }
 
     private fun drawCombatHud(canvas: Canvas, eng: DbxwCoreEngine) {
@@ -1226,10 +1425,15 @@ class GameSurfaceView(
         }
 
         // Round label
-        textPaint.typeface = repo.fontSuperSquad
-        textPaint.textSize = 24f
-        textPaint.color = Color.argb(210, 210, 225, 255)
-        canvas.drawText("R${eng.currentRound}/${eng.totalRounds}", 540f, 238f, textPaint)
+        drawFitText(
+            canvas,
+            "R${eng.currentRound}/${eng.totalRounds}",
+            540f,
+            238f,
+            maxWidth = 140f,
+            maxSize = 24f,
+            color = Color.argb(225, 210, 225, 255)
+        )
 
         if (repo.settings.showFps) {
             textPaint.typeface = Typeface.DEFAULT_BOLD
@@ -1319,11 +1523,17 @@ class GameSurfaceView(
         canvas.drawRoundRect(chargeBg, 7f, 7f, strokePaint)
 
         // Level Badge (lv. 0..3) & Round Win Dots
-        textPaint.typeface = repo.fontSuperSquad
-        textPaint.textSize = 26f
-        textPaint.color = Color.CYAN
         val lvX = if (isLeft) barLeft else barRight
-        canvas.drawText("LV.${f.chargeLevel}", lvX, 170f, textPaint)
+        drawFitText(
+            canvas,
+            "LV.${f.chargeLevel}",
+            lvX,
+            170f,
+            maxWidth = 90f,
+            maxSize = 26f,
+            align = if (isLeft) Paint.Align.LEFT else Paint.Align.RIGHT,
+            color = Color.CYAN
+        )
 
         val winsNeeded = (totalRounds / 2) + 1
         for (w in 0 until winsNeeded) {
@@ -1333,10 +1543,16 @@ class GameSurfaceView(
         }
 
         // Live Score & Combo Hits
-        textPaint.typeface = repo.fontSuperSquad
-        textPaint.textSize = 26f
-        textPaint.color = Color.rgb(255, 225, 120)
-        canvas.drawText("PTS: ${f.dmgAccum.toLong()}", lvX, 206f, textPaint)
+        drawFitText(
+            canvas,
+            "PTS: ${f.dmgAccum.toLong()}",
+            lvX,
+            206f,
+            maxWidth = barWidth,
+            maxSize = 26f,
+            align = if (isLeft) Paint.Align.LEFT else Paint.Align.RIGHT,
+            color = Color.rgb(255, 225, 120)
+        )
 
         if (f.comboCount > 0) {
             textPaint.typeface = repo.fontGreatFighter
@@ -1398,10 +1614,15 @@ class GameSurfaceView(
         }
 
         // Music player section (Slide12)
-        textPaint.typeface = repo.fontSuperSquad
-        textPaint.textSize = 32f
-        textPaint.color = Color.CYAN
-        canvas.drawText("${repo.tr(37, "Musica", "Music")}: ${sound.currentBattleTrack()?.name?.take(26) ?: "-"}", panel.centerX(), 1075f, textPaint)
+        drawFitText(
+            canvas,
+            "${repo.tr(37, "Musica", "Music")}: ${sound.currentBattleTrack()?.name?.take(30) ?: "-"}",
+            panel.centerX(),
+            1075f,
+            maxWidth = panel.width() - 60f,
+            maxSize = 30f,
+            color = Color.CYAN
+        )
 
         drawButton(canvas, RectF(130f, 1130f, 400f, 1245f), repo.tr(38, "Anterior", "Previous"), Color.rgb(45, 75, 145), textSize = 28f) {
             sound.previousBattleTrack()
@@ -1439,10 +1660,15 @@ class GameSurfaceView(
             ?: w.def.ico
         drawFitBitmap(canvas, repo.getBitmap(winPath), RectF(220f, 290f, 860f, 890f))
 
-        textPaint.typeface = repo.fontSuperSquad
-        textPaint.textSize = 46f
-        textPaint.color = Color.rgb(255, 225, 120)
-        canvas.drawText("${if (repo.isSpanish()) "Puntuación" else "Score"}: ${w.dmgAccum.toLong()}", VW * 0.5f, 975f, textPaint)
+        drawFitText(
+            canvas,
+            "${if (repo.isSpanish()) "Puntuación" else "Score"}: ${w.dmgAccum.toLong()}",
+            VW * 0.5f,
+            975f,
+            maxWidth = VW - 120f,
+            maxSize = 44f,
+            color = Color.rgb(255, 225, 120)
+        )
 
         textPaint.typeface = repo.fontGreatFighter
         textPaint.textSize = 110f
@@ -1508,18 +1734,44 @@ class GameSurfaceView(
         fun drawToggleRow(label: String, value: Boolean, onToggle: () -> Unit) {
             val row = RectF(44f, y, VW - 44f, y + 108f)
             if (row.bottom > listTop && row.top < listBottom) {
-                fillPaint.color = Color.argb(210, 20, 27, 48)
+                fillPaint.color = Color.argb(220, 20, 27, 48)
                 canvas.drawRoundRect(row, 18f, 18f, fillPaint)
-                textPaint.typeface = Typeface.DEFAULT_BOLD
-                textPaint.textSize = 30f
-                textPaint.textAlign = Paint.Align.LEFT
-                textPaint.color = Color.WHITE
-                canvas.drawText(label, row.left + 28f, row.centerY() + 10f, textPaint)
+                strokePaint.color = Color.argb(95, 130, 165, 230)
+                strokePaint.strokeWidth = 2f
+                canvas.drawRoundRect(row, 18f, 18f, strokePaint)
 
-                val btnRect = RectF(row.right - 230f, row.top + 16f, row.right - 18f, row.bottom - 16f)
+                val btnRect = RectF(row.right - 250f, row.top + 16f, row.right - 18f, row.bottom - 16f)
+                drawFitText(
+                    canvas,
+                    label,
+                    row.left + 26f,
+                    row.centerY() + 10f,
+                    maxWidth = btnRect.left - row.left - 44f,
+                    maxSize = 30f,
+                    minSize = 20f,
+                    align = Paint.Align.LEFT,
+                    color = Color.WHITE
+                )
+
                 val txt = if (value) repo.tr(76, "Activado", "Enabled") else repo.tr(75, "Desactivado", "Disabled")
-                if (row.top >= listTop - 20f && row.bottom <= listBottom + 20f) {
-                    drawButton(canvas, btnRect, txt, if (value) Color.rgb(35, 155, 80) else Color.rgb(155, 50, 50), Color.WHITE, 24f) {
+                fillPaint.color = if (value) Color.rgb(35, 155, 80) else Color.rgb(155, 50, 50)
+                canvas.drawRoundRect(btnRect, 18f, 18f, fillPaint)
+                strokePaint.color = Color.WHITE
+                strokePaint.strokeWidth = 3f
+                canvas.drawRoundRect(btnRect, 18f, 18f, strokePaint)
+                drawFitText(
+                    canvas,
+                    txt,
+                    btnRect.centerX(),
+                    btnRect.centerY() + 9f,
+                    maxWidth = btnRect.width() - 20f,
+                    maxSize = 25f,
+                    minSize = 18f,
+                    color = Color.WHITE
+                )
+
+                if (row.top >= listTop - 35f && row.bottom <= listBottom + 35f) {
+                    registerClick(row, pad = 6f) {
                         sound.playUiClick()
                         onToggle()
                         repo.saveSettings()
@@ -1533,17 +1785,43 @@ class GameSurfaceView(
         fun drawChoiceRow(label: String, valueText: String, onCycle: () -> Unit) {
             val row = RectF(44f, y, VW - 44f, y + 108f)
             if (row.bottom > listTop && row.top < listBottom) {
-                fillPaint.color = Color.argb(210, 20, 27, 48)
+                fillPaint.color = Color.argb(220, 20, 27, 48)
                 canvas.drawRoundRect(row, 18f, 18f, fillPaint)
-                textPaint.typeface = Typeface.DEFAULT_BOLD
-                textPaint.textSize = 30f
-                textPaint.textAlign = Paint.Align.LEFT
-                textPaint.color = Color.WHITE
-                canvas.drawText(label, row.left + 28f, row.centerY() + 10f, textPaint)
+                strokePaint.color = Color.argb(95, 130, 165, 230)
+                strokePaint.strokeWidth = 2f
+                canvas.drawRoundRect(row, 18f, 18f, strokePaint)
 
-                val btnRect = RectF(row.right - 290f, row.top + 16f, row.right - 18f, row.bottom - 16f)
-                if (row.top >= listTop - 20f && row.bottom <= listBottom + 20f) {
-                    drawButton(canvas, btnRect, valueText, Color.rgb(45, 95, 185), Color.WHITE, 26f) {
+                val btnRect = RectF(row.right - 295f, row.top + 16f, row.right - 18f, row.bottom - 16f)
+                drawFitText(
+                    canvas,
+                    label,
+                    row.left + 26f,
+                    row.centerY() + 10f,
+                    maxWidth = btnRect.left - row.left - 44f,
+                    maxSize = 30f,
+                    minSize = 20f,
+                    align = Paint.Align.LEFT,
+                    color = Color.WHITE
+                )
+
+                fillPaint.color = Color.rgb(45, 95, 185)
+                canvas.drawRoundRect(btnRect, 18f, 18f, fillPaint)
+                strokePaint.color = Color.WHITE
+                strokePaint.strokeWidth = 3f
+                canvas.drawRoundRect(btnRect, 18f, 18f, strokePaint)
+                drawFitText(
+                    canvas,
+                    valueText,
+                    btnRect.centerX(),
+                    btnRect.centerY() + 9f,
+                    maxWidth = btnRect.width() - 20f,
+                    maxSize = 26f,
+                    minSize = 18f,
+                    color = Color.WHITE
+                )
+
+                if (row.top >= listTop - 35f && row.bottom <= listBottom + 35f) {
+                    registerClick(row, pad = 6f) {
                         sound.playUiClick()
                         onCycle()
                         repo.saveSettings()
@@ -1635,10 +1913,15 @@ class GameSurfaceView(
         canvas.drawText("Android Vertical Native Port: dorlanpabon", VW * 0.5f, 335f, textPaint)
 
         // Victory Streak History
-        textPaint.typeface = repo.fontSuperSquad
-        textPaint.textSize = 36f
-        textPaint.color = Color.CYAN
-        canvas.drawText(if (repo.isSpanish()) "HISTORIAL DE VICTORIAS" else "VICTORY HISTORY", VW * 0.5f, 430f, textPaint)
+        drawFitText(
+            canvas,
+            if (repo.isSpanish()) "HISTORIAL DE VICTORIAS" else "VICTORY HISTORY",
+            VW * 0.5f,
+            430f,
+            maxWidth = VW - 120f,
+            maxSize = 36f,
+            color = Color.CYAN
+        )
 
         val records = repo.getWinRecords()
         var ry = 495f
@@ -1675,69 +1958,111 @@ class GameSurfaceView(
         canvas.drawRect(0f, 0f, VW, VH, fillPaint)
         drawHeaderTitle(canvas, if (isEs) "TIKTOK LIVE INTERACTIVO" else "INTERACTIVE TIKTOK LIVE")
 
-        // Card 1: Play Style (y: 148..410)
-        val c1 = RectF(34f, 148f, VW - 34f, 410f)
+        // Card 1: Play Style (y: 142..364)
+        val c1 = RectF(34f, 142f, VW - 34f, 364f)
         fillPaint.color = Color.argb(225, 18, 22, 40)
         canvas.drawRoundRect(c1, 22f, 22f, fillPaint)
         strokePaint.color = Color.rgb(254, 44, 85)
         strokePaint.strokeWidth = 3f
         canvas.drawRoundRect(c1, 22f, 22f, strokePaint)
 
-        textPaint.typeface = repo.fontSuperSquad
-        textPaint.textSize = 28f
-        textPaint.textAlign = Paint.Align.CENTER
-        textPaint.color = Color.rgb(37, 244, 238)
-        canvas.drawText(if (isEs) "1. ESTILO DEL DIRECTO" else "1. STREAM STYLE", VW * 0.5f, 194f, textPaint)
+        drawFitText(
+            canvas,
+            if (isEs) "1. ESTILO DEL DIRECTO" else "1. STREAM STYLE",
+            VW * 0.5f,
+            184f,
+            maxWidth = c1.width() - 40f,
+            maxSize = 28f,
+            color = Color.rgb(37, 244, 238)
+        )
 
         val autoActive = tiktok.playStyle == TikTokPlayStyle.AUTO_ARENA
         drawButton(
             canvas,
-            RectF(56f, 220f, 526f, 385f),
+            RectF(56f, 204f, 526f, 344f),
             if (isEs) "🤖 ARENA 24/7\n(CHAT VS CHAT)" else "🤖 24/7 ARENA\n(CHAT VS CHAT)",
             if (autoActive) Color.rgb(210, 35, 85) else Color.rgb(34, 42, 68),
             if (autoActive) Color.rgb(37, 244, 238) else Color.rgb(100, 120, 165),
-            textSize = 24f
+            textSize = 25f
         ) {
             sound.playCursor()
             tiktok.playStyle = TikTokPlayStyle.AUTO_ARENA
         }
         drawButton(
             canvas,
-            RectF(554f, 220f, 1024f, 385f),
+            RectF(554f, 204f, 1024f, 344f),
             if (isEs) "🎮 STREAMER (J1)\nVS CHAT (J2)" else "🎮 STREAMER (P1)\nVS CHAT (P2)",
             if (!autoActive) Color.rgb(35, 130, 215) else Color.rgb(34, 42, 68),
             if (!autoActive) Color.rgb(255, 215, 65) else Color.rgb(100, 120, 165),
-            textSize = 24f
+            textSize = 25f
         ) {
             sound.playCursor()
             tiktok.playStyle = TikTokPlayStyle.STREAMER_VS_CHAT
         }
 
-        // Card 2: Bridge & Simulator Config (y: 430..845)
-        val c2 = RectF(34f, 430f, VW - 34f, 845f)
+        // Card 2: Phone Direct Listener, Bridge & Simulator Config (y: 380..884)
+        val c2 = RectF(34f, 380f, VW - 34f, 884f)
         fillPaint.color = Color.argb(225, 18, 22, 40)
         canvas.drawRoundRect(c2, 22f, 22f, fillPaint)
         strokePaint.color = Color.rgb(37, 244, 238)
         strokePaint.strokeWidth = 3f
         canvas.drawRoundRect(c2, 22f, 22f, strokePaint)
 
-        textPaint.typeface = repo.fontSuperSquad
-        textPaint.textSize = 28f
-        textPaint.textAlign = Paint.Align.CENTER
-        textPaint.color = Color.rgb(255, 215, 65)
-        canvas.drawText(if (isEs) "2. CONEXIÓN TIKTOK Y SIMULADOR" else "2. TIKTOK BRIDGE & SIMULATOR", VW * 0.5f, 474f, textPaint)
+        drawFitText(
+            canvas,
+            if (isEs) "2. CONEXIÓN EN TELÉFONO, PC Y SIMULADOR" else "2. PHONE DIRECT, BRIDGE & SIMULATOR",
+            VW * 0.5f,
+            420f,
+            maxWidth = c2.width() - 40f,
+            maxSize = 27f,
+            color = Color.rgb(255, 215, 65)
+        )
+
+        val phoneBtnTitle = if (tiktok.directUsername.isNotBlank()) {
+            val stateLbl = if (tiktok.directPhoneConnected) "LIVE OK" else tiktok.directStatusText
+            "📱 ${tiktok.directUsername} [$stateLbl]\n${if (isEs) "Toca para conectar o cambiar usuario" else "Tap to connect or edit user"}"
+        } else {
+            if (isEs) "📱 CONECTAR @USUARIO EN TELÉFONO\nEscucha chat y regalos directo sin PC" else "📱 CONNECT @USER ON PHONE\nListen live chat & gifts without PC"
+        }
+        drawButton(
+            canvas,
+            RectF(54f, 444f, 750f, 542f),
+            phoneBtnTitle,
+            if (tiktok.directPhoneConnected) Color.rgb(25, 155, 90) else if (tiktok.directPhoneEnabled) Color.rgb(190, 105, 25) else Color.rgb(210, 35, 85),
+            Color.rgb(37, 244, 238),
+            textSize = 23f
+        ) {
+            sound.playUiClick()
+            tiktok.requestPhoneConnectDialog()
+        }
+        drawButton(
+            canvas,
+            RectF(768f, 444f, 1026f, 542f),
+            if (isEs) "❓ CÓMO\nCONFIGURAR" else "❓ HOW TO\nSETUP",
+            Color.rgb(45, 95, 195),
+            Color.rgb(255, 215, 65),
+            textSize = 22f
+        ) {
+            sound.playUiClick()
+            tiktokHelpVisible = true
+        }
 
         val statusTxt = if (tiktok.webhookRunning) "ONLINE" else "OFFLINE"
         val ipStr = tiktok.getLocalIpAddress()
-        textPaint.typeface = Typeface.DEFAULT_BOLD
-        textPaint.textSize = 24f
-        textPaint.color = if (tiktok.webhookRunning) Color.rgb(80, 245, 135) else Color.rgb(255, 120, 120)
-        canvas.drawText("Webhook [$statusTxt]: http://$ipStr:${tiktok.webhookPort}/event", VW * 0.5f, 514f, textPaint)
+        drawFitText(
+            canvas,
+            "Webhook [$statusTxt]: http://$ipStr:${tiktok.webhookPort}/event",
+            VW * 0.5f,
+            576f,
+            maxWidth = c2.width() - 48f,
+            maxSize = 22f,
+            color = if (tiktok.webhookRunning) Color.rgb(80, 245, 135) else Color.rgb(255, 120, 120)
+        )
 
-        // Row 1: Simulator toggle + Intensity
+        // Row B: Simulator toggle + Intensity
         drawButton(
             canvas,
-            RectF(56f, 540f, 580f, 622f),
+            RectF(54f, 596f, 580f, 678f),
             if (isEs) "Simulador Audiencia: ${if (tiktok.simulatorEnabled) "SI" else "NO"}" else "Audience Sim: ${if (tiktok.simulatorEnabled) "ON" else "OFF"}",
             if (tiktok.simulatorEnabled) Color.rgb(35, 155, 80) else Color.rgb(140, 50, 55),
             Color.WHITE,
@@ -1747,16 +2072,16 @@ class GameSurfaceView(
             tiktok.simulatorEnabled = !tiktok.simulatorEnabled
         }
         val intLabel = if (isEs) "Ritmo: ${tiktok.simulatorIntensity.labelEs}" else "Rate: ${tiktok.simulatorIntensity.labelEn}"
-        drawButton(canvas, RectF(600f, 540f, 1024f, 622f), intLabel, Color.rgb(45, 95, 185), Color.WHITE, 24f) {
+        drawButton(canvas, RectF(600f, 596f, 1026f, 678f), intLabel, Color.rgb(45, 95, 185), Color.WHITE, 24f) {
             sound.playUiClick()
             val vals = SimulatorIntensity.values()
             tiktok.simulatorIntensity = vals[(tiktok.simulatorIntensity.ordinal + 1) % vals.size]
         }
 
-        // Row 2: Auto-Rematch King of the Hill + TikFinity WS
+        // Row C: Auto-Rematch King of the Hill + TikFinity WS
         drawButton(
             canvas,
-            RectF(56f, 642f, 580f, 724f),
+            RectF(54f, 694f, 580f, 776f),
             if (isEs) "Rey de la Colina 24/7: ${if (tiktok.autoRematchEnabled) "SI" else "NO"}" else "24/7 King of Hill: ${if (tiktok.autoRematchEnabled) "ON" else "OFF"}",
             if (tiktok.autoRematchEnabled) Color.rgb(35, 155, 80) else Color.rgb(140, 50, 55),
             Color.WHITE,
@@ -1768,7 +2093,7 @@ class GameSurfaceView(
         val tfStatus = if (tiktok.tikFinityConnected) "WS OK" else if (tiktok.tikFinityEnabled) "WAIT" else "OFF"
         drawButton(
             canvas,
-            RectF(600f, 642f, 1024f, 724f),
+            RectF(600f, 694f, 1026f, 776f),
             "TikFinity :21213 [$tfStatus]",
             if (tiktok.tikFinityEnabled) Color.rgb(135, 65, 195) else Color.rgb(48, 56, 82),
             Color.WHITE,
@@ -1776,13 +2101,17 @@ class GameSurfaceView(
         ) {
             sound.playUiClick()
             tiktok.tikFinityEnabled = !tiktok.tikFinityEnabled
-            if (tiktok.tikFinityEnabled) tiktok.startTikFinityClient()
+            if (tiktok.tikFinityEnabled) {
+                tiktok.startTikFinityClient()
+            } else {
+                tiktok.stopTikFinityClient()
+            }
         }
 
-        // Difficulty selector row
+        // Row D: Difficulty + Roster selector
         drawButton(
             canvas,
-            RectF(56f, 744f, 526f, 822f),
+            RectF(54f, 792f, 526f, 868f),
             if (isEs) "Dificultad IA Bots: Nivel $botDifficulty" else "Bot AI Level: $botDifficulty",
             Color.rgb(42, 62, 108),
             Color.WHITE,
@@ -1793,7 +2122,7 @@ class GameSurfaceView(
         }
         drawButton(
             canvas,
-            RectF(548f, 744f, 1024f, 822f),
+            RectF(548f, 792f, 1026f, 868f),
             if (isEs) "Elegir Peleadores / Mapa" else "Pick Fighters / Stage",
             Color.rgb(215, 125, 30),
             Color.WHITE,
@@ -1803,29 +2132,33 @@ class GameSurfaceView(
             goToScreen(ScreenState.CHAR_SELECT)
         }
 
-        // Card 3: Gift Rewards Guide (y: 865..1240)
-        val c3 = RectF(34f, 865f, VW - 34f, 1240f)
+        // Card 3: Gift Rewards Guide (y: 900..1264)
+        val c3 = RectF(34f, 900f, VW - 34f, 1264f)
         fillPaint.color = Color.argb(225, 16, 20, 36)
         canvas.drawRoundRect(c3, 22f, 22f, fillPaint)
         strokePaint.color = Color.rgb(255, 200, 55)
         strokePaint.strokeWidth = 2.5f
         canvas.drawRoundRect(c3, 22f, 22f, strokePaint)
 
-        textPaint.typeface = repo.fontSuperSquad
-        textPaint.textSize = 27f
-        textPaint.textAlign = Paint.Align.CENTER
-        textPaint.color = Color.rgb(255, 215, 65)
-        canvas.drawText(if (isEs) "3. PODERES POR REGALO EN VIVO" else "3. LIVE GIFT POWER-UPS", VW * 0.5f, 908f, textPaint)
+        drawFitText(
+            canvas,
+            if (isEs) "3. PODERES POR REGALO EN VIVO" else "3. LIVE GIFT POWER-UPS",
+            VW * 0.5f,
+            942f,
+            maxWidth = c3.width() - 40f,
+            maxSize = 27f,
+            color = Color.rgb(255, 215, 65)
+        )
 
         val gifts = TikTokGiftKind.values()
         val gCols = 2
         val gW = 480f
-        val gH = 90f
+        val gH = 86f
         gifts.forEachIndexed { idx, g ->
             val col = idx % gCols
             val row = idx / gCols
             val gx = 54f + col * (gW + 12f)
-            val gy = 928f + row * (gH + 10f)
+            val gy = 962f + row * (gH + 10f)
             val gr = RectF(gx, gy, gx + gW, gy + gH)
             fillPaint.color = Color.argb(215, 26, 33, 56)
             canvas.drawRoundRect(gr, 14f, 14f, fillPaint)
@@ -1833,50 +2166,74 @@ class GameSurfaceView(
             strokePaint.strokeWidth = 2f
             canvas.drawRoundRect(gr, 14f, 14f, strokePaint)
 
-            textPaint.typeface = repo.fontSuperSquad
-            textPaint.textSize = 23f
-            textPaint.textAlign = Paint.Align.LEFT
-            textPaint.color = Color.WHITE
             val title = if (isEs) g.titleEs else g.titleEn
-            canvas.drawText("${g.icon} $title (${g.coins}🪙)", gr.left + 16f, gr.top + 36f, textPaint)
+            drawFitText(
+                canvas,
+                "${g.icon} $title (${g.coins}🪙)",
+                gr.left + 14f,
+                gr.top + 34f,
+                maxWidth = gr.width() - 28f,
+                maxSize = 22f,
+                minSize = 16f,
+                align = Paint.Align.LEFT,
+                color = Color.WHITE
+            )
 
-            textPaint.typeface = Typeface.DEFAULT_BOLD
-            textPaint.textSize = 21f
-            textPaint.color = Color.rgb(185, 225, 255)
             val eff = if (isEs) g.effectEs else g.effectEn
-            canvas.drawText("→ $eff", gr.left + 16f, gr.top + 70f, textPaint)
+            drawFitText(
+                canvas,
+                "→ $eff",
+                gr.left + 14f,
+                gr.top + 68f,
+                maxWidth = gr.width() - 28f,
+                maxSize = 20f,
+                minSize = 15f,
+                align = Paint.Align.LEFT,
+                color = Color.rgb(185, 225, 255)
+            )
         }
 
-        // Card 4: Initial Fighters Preview (y: 1260..1535)
-        val c4 = RectF(34f, 1260f, VW - 34f, 1535f)
+        // Card 4: Initial Fighters Preview (y: 1280..1542)
+        val c4 = RectF(34f, 1280f, VW - 34f, 1542f)
         fillPaint.color = Color.argb(225, 18, 24, 42)
         canvas.drawRoundRect(c4, 22f, 22f, fillPaint)
         strokePaint.color = Color.argb(180, 120, 155, 220)
         strokePaint.strokeWidth = 2.5f
         canvas.drawRoundRect(c4, 22f, 22f, strokePaint)
 
-        drawFitBitmap(canvas, repo.getBitmap(p1Char.ico), RectF(66f, 1285f, 250f, 1475f))
-        drawFitBitmap(canvas, repo.getBitmap(p2Char.ico), RectF(VW - 250f, 1285f, VW - 66f, 1475f))
+        drawFitBitmap(canvas, repo.getBitmap(p1Char.ico), RectF(66f, 1304f, 246f, 1484f))
+        drawFitBitmap(canvas, repo.getBitmap(p2Char.ico), RectF(VW - 246f, 1304f, VW - 66f, 1484f))
 
         textPaint.typeface = repo.fontGreatFighter
         textPaint.textSize = 42f
         textPaint.textAlign = Paint.Align.CENTER
         textPaint.color = Color.rgb(255, 210, 50)
-        canvas.drawText("VS", VW * 0.5f, 1370f, textPaint)
+        canvas.drawText("VS", VW * 0.5f, 1378f, textPaint)
 
-        textPaint.typeface = repo.fontSuperSquad
-        textPaint.textSize = 26f
-        textPaint.color = Color.WHITE
-        canvas.drawText("🔵 ${p1Char.name}   vs   🔴 ${p2Char.name}", VW * 0.5f, 1435f, textPaint)
-        textPaint.typeface = Typeface.DEFAULT_BOLD
-        textPaint.textSize = 23f
-        textPaint.color = Color.rgb(160, 210, 255)
-        canvas.drawText("${if (isEs) "Escenario" else "Stage"}: ${selectedStage.name}", VW * 0.5f, 1495f, textPaint)
+        drawFitText(
+            canvas,
+            "🔵 ${p1Char.name}   vs   🔴 ${p2Char.name}",
+            VW * 0.5f,
+            1444f,
+            maxWidth = 520f,
+            maxSize = 26f,
+            color = Color.WHITE
+        )
+
+        drawFitText(
+            canvas,
+            "${if (isEs) "Escenario" else "Stage"}: ${selectedStage.name}",
+            VW * 0.5f,
+            1502f,
+            maxWidth = 520f,
+            maxSize = 23f,
+            color = Color.rgb(160, 210, 255)
+        )
 
         // Start Live Button + Back
         drawButton(
             canvas,
-            RectF(80f, 1570f, VW - 80f, 1710f),
+            RectF(80f, 1568f, VW - 80f, 1706f),
             if (isEs) "🔴 ¡INICIAR DIRECTO TIKTOK!" else "🔴 START TIKTOK LIVE!",
             Color.rgb(225, 35, 80),
             Color.rgb(37, 244, 238),
@@ -1887,8 +2244,186 @@ class GameSurfaceView(
             goToScreen(ScreenState.LOADING)
         }
 
-        drawButton(canvas, RectF(180f, 1745f, 900f, 1870f), repo.tr(22, "Volver", "Back"), Color.rgb(65, 75, 100)) {
+        drawButton(canvas, RectF(180f, 1742f, 900f, 1868f), repo.tr(22, "Volver", "Back"), Color.rgb(65, 75, 100)) {
             goToScreen(ScreenState.MAIN_MENU)
+        }
+
+        if (tiktokHelpVisible) {
+            drawTikTokHelpModal(canvas)
+        }
+    }
+
+    private fun drawTikTokHelpModal(canvas: Canvas) {
+        val isEs = repo.isSpanish()
+        buildingTargets.clear()
+
+        fillPaint.color = Color.argb(230, 4, 6, 14)
+        canvas.drawRect(0f, 0f, VW, VH, fillPaint)
+
+        val modal = RectF(44f, 105f, VW - 44f, 1815f)
+        fillPaint.color = Color.rgb(16, 22, 42)
+        canvas.drawRoundRect(modal, 28f, 28f, fillPaint)
+        strokePaint.color = Color.rgb(37, 244, 238)
+        strokePaint.strokeWidth = 4f
+        canvas.drawRoundRect(modal, 28f, 28f, strokePaint)
+
+        drawFitText(
+            canvas,
+            if (isEs) "📱 ¿CÓMO CONFIGURAR TIKTOK LIVE?" else "📱 HOW TO SETUP TIKTOK LIVE",
+            modal.centerX(),
+            174f,
+            maxWidth = modal.width() - 60f,
+            maxSize = 36f,
+            color = Color.rgb(255, 215, 65)
+        )
+
+        fun drawGuideSection(top: Float, bottom: Float, borderColor: Int, heading: String, lines: List<String>) {
+            val box = RectF(modal.left + 26f, top, modal.right - 26f, bottom)
+            fillPaint.color = Color.argb(225, 24, 31, 56)
+            canvas.drawRoundRect(box, 18f, 18f, fillPaint)
+            strokePaint.color = borderColor
+            strokePaint.strokeWidth = 2.5f
+            canvas.drawRoundRect(box, 18f, 18f, strokePaint)
+
+            drawFitText(
+                canvas,
+                heading,
+                box.left + 22f,
+                box.top + 40f,
+                maxWidth = box.width() - 44f,
+                maxSize = 25f,
+                align = Paint.Align.LEFT,
+                color = borderColor
+            )
+            var ly = box.top + 78f
+            val step = ((box.height() - 88f) / lines.size.coerceAtLeast(1)).coerceIn(28f, 38f)
+            for (ln in lines) {
+                drawFitText(
+                    canvas,
+                    ln,
+                    box.left + 22f,
+                    ly,
+                    maxWidth = box.width() - 44f,
+                    maxSize = 22f,
+                    minSize = 15f,
+                    align = Paint.Align.LEFT,
+                    color = Color.WHITE
+                )
+                ly += step
+            }
+        }
+
+        val ipStr = tiktok.getLocalIpAddress()
+        if (isEs) {
+            drawGuideSection(
+                205f, 540f, Color.rgb(37, 244, 238),
+                "OPCIÓN 1: DIRECTO EN TU TELÉFONO (SIN PC)",
+                listOf(
+                    "1. Inicia tu Live en TikTok desde tu cuenta (@usuario).",
+                    "2. Toca \"CONECTAR @USUARIO EN TELÉFONO\" y escribe tu usuario.",
+                    "3. El juego lee el chat y regalos en segundo plano directo.",
+                    "4. Si TikTok pide verificación captcha web, usa la Opción 2 o 3.",
+                    "Consejo: Funciona ideal para Arena 24/7 o Streamer vs Chat."
+                )
+            )
+            drawGuideSection(
+                558f, 878f, Color.rgb(255, 210, 65),
+                "OPCIÓN 2: TERMUX EN EL TELÉFONO O PYTHON EN PC",
+                listOf(
+                    "1. Instala Python + librerías: pip install TikTokLive requests",
+                    "2. En Termux (mismo teléfono) apunta a 127.0.0.1:",
+                    "   python scripts/tiktok_live_bridge.py --user @tu_user --target http://127.0.0.1:${tiktok.webhookPort}/event",
+                    "3. O desde un PC en tu Wi-Fi usando: http://$ipStr:${tiktok.webhookPort}/event"
+                )
+            )
+            drawGuideSection(
+                896f, 1150f, Color.rgb(225, 95, 255),
+                "OPCIÓN 3: TIKFINITY EN PC (MISMA RED WI-FI)",
+                listOf(
+                    "1. Abre TikFinity en tu PC conectado a tu transmisión en vivo.",
+                    "2. Activa Webhook hacia http://$ipStr:${tiktok.webhookPort}/event",
+                    "   o enciende el botón \"TikFinity :21213\" en la app."
+                )
+            )
+            drawGuideSection(
+                1168f, 1585f, Color.rgb(80, 240, 140),
+                "COMANDOS DEL CHAT Y REGALOS PARA ESPECTADORES",
+                listOf(
+                    "• !j1 / !j2            -> Apoyar al Equipo 1 o Equipo 2",
+                    "• !j1 goku / !j2 broly -> Unirse a la cola como nuevo retador",
+                    "• !ki  /  !kame        -> Cargar energía Ki / Lanzar súper ataque",
+                    "• !ssj / !kaioken      -> Transformación / Activar Kaioken",
+                    "• !curar / !tiempo     -> Recuperar +25% HP / Congelar tiempo",
+                    "• Regalos (Rosa, GG, León...) activan súper poderes al instante."
+                )
+            )
+        } else {
+            drawGuideSection(
+                205f, 540f, Color.rgb(37, 244, 238),
+                "OPTION 1: DIRECTLY ON YOUR PHONE (NO PC)",
+                listOf(
+                    "1. Start your TikTok Live stream on your account (@username).",
+                    "2. Tap \"CONNECT @USER ON PHONE\" and enter your handle.",
+                    "3. The app reads live chat & gifts in a background web view.",
+                    "4. If TikTok prompts web verification, use Option 2 or 3.",
+                    "Tip: Ideal for 24/7 Arena or Streamer vs Chat modes."
+                )
+            )
+            drawGuideSection(
+                558f, 878f, Color.rgb(255, 210, 65),
+                "OPTION 2: TERMUX ON PHONE OR PYTHON ON PC",
+                listOf(
+                    "1. Install Python packages: pip install TikTokLive requests",
+                    "2. On Termux (same phone) forward to localhost:",
+                    "   python scripts/tiktok_live_bridge.py --user @user --target http://127.0.0.1:${tiktok.webhookPort}/event",
+                    "3. Or from PC on the same Wi-Fi: http://$ipStr:${tiktok.webhookPort}/event"
+                )
+            )
+            drawGuideSection(
+                896f, 1150f, Color.rgb(225, 95, 255),
+                "OPTION 3: TIKFINITY ON PC (SAME WI-FI)",
+                listOf(
+                    "1. Open TikFinity on your PC connected to your live stream.",
+                    "2. Point Webhook actions to http://$ipStr:${tiktok.webhookPort}/event",
+                    "   or toggle the \"TikFinity :21213\" button in the Hub."
+                )
+            )
+            drawGuideSection(
+                1168f, 1585f, Color.rgb(80, 240, 140),
+                "VIEWER CHAT COMMANDS & LIVE GIFTS",
+                listOf(
+                    "• !p1 / !p2            -> Cheer for Team 1 or Team 2",
+                    "• !p1 goku / !p2 broly -> Join the challenger queue",
+                    "• !ki  /  !blast       -> Charge Ki / Fire energy blast",
+                    "• !ssj / !kaioken      -> Transform / Activate Kaioken",
+                    "• !heal / !timejump    -> Restore +25% HP / Freeze time",
+                    "• Gifts (Rose, GG, Lion...) trigger instant team power-ups."
+                )
+            )
+        }
+
+        drawButton(
+            canvas,
+            RectF(82f, 1622f, 520f, 1756f),
+            if (isEs) "📱 CONECTAR @USUARIO" else "📱 CONNECT @USER",
+            Color.rgb(210, 35, 85),
+            Color.rgb(37, 244, 238),
+            textSize = 26f
+        ) {
+            sound.playUiClick()
+            tiktokHelpVisible = false
+            tiktok.requestPhoneConnectDialog()
+        }
+        drawButton(
+            canvas,
+            RectF(556f, 1622f, 998f, 1756f),
+            if (isEs) "✅ ENTENDIDO" else "✅ GOT IT",
+            Color.rgb(35, 155, 80),
+            Color.WHITE,
+            textSize = 28f
+        ) {
+            sound.playUiClick()
+            tiktokHelpVisible = false
         }
     }
 
@@ -1903,11 +2438,15 @@ class GameSurfaceView(
         strokePaint.strokeWidth = 2f
         canvas.drawRoundRect(livePill, 16f, 16f, strokePaint)
 
-        textPaint.typeface = repo.fontSuperSquad
-        textPaint.textSize = 24f
-        textPaint.textAlign = Paint.Align.CENTER
-        textPaint.color = Color.WHITE
-        canvas.drawText("🔴 LIVE  ${tiktok.viewerCount}", livePill.centerX(), 337f, textPaint)
+        drawFitText(
+            canvas,
+            "🔴 LIVE  ${tiktok.viewerCount}",
+            livePill.centerX(),
+            337f,
+            maxWidth = livePill.width() - 20f,
+            maxSize = 24f,
+            color = Color.WHITE
+        )
 
         // Tug-of-War Like / Momentum Bar (x: 292..788, y: 294..362)
         val momLeft = 292f
@@ -1946,20 +2485,30 @@ class GameSurfaceView(
         canvas.drawRoundRect(rightPill, 16f, 16f, strokePaint)
 
         val nextQueued = tiktok.challengerQueue.firstOrNull()
-        textPaint.typeface = repo.fontSuperSquad
-        textPaint.textSize = 21f
-        textPaint.textAlign = Paint.Align.CENTER
-        textPaint.color = Color.rgb(255, 220, 70)
         val badgeTop = "🔥 ${if (isEs) "RACHA" else "STREAK"} x${maxOf(1, tiktok.winStreak)}"
-        canvas.drawText(badgeTop, rightPill.centerX(), 322f, textPaint)
-        textPaint.textSize = 18f
-        textPaint.color = Color.CYAN
+        drawFitText(
+            canvas,
+            badgeTop,
+            rightPill.centerX(),
+            322f,
+            maxWidth = rightPill.width() - 18f,
+            maxSize = 21f,
+            color = Color.rgb(255, 220, 70)
+        )
         val badgeBot = if (nextQueued != null) {
             "NEXT: ${nextQueued.character.name.take(10)}"
         } else {
             "${if (isEs) "COLA" else "QUEUE"}: ${tiktok.challengerQueue.size}"
         }
-        canvas.drawText(badgeBot, rightPill.centerX(), 352f, textPaint)
+        drawFitText(
+            canvas,
+            badgeBot,
+            rightPill.centerX(),
+            352f,
+            maxWidth = rightPill.width() - 18f,
+            maxSize = 18f,
+            color = Color.CYAN
+        )
 
         // 2. Floating Gift / Special Command Alert inside Top of Arena (y: 402..512)
         tiktok.activeAlert?.let { alert ->
@@ -1977,10 +2526,15 @@ class GameSurfaceView(
             textPaint.setShadowLayer(4f, 2f, 2f, Color.BLACK)
             canvas.drawText(alert.headline, alertBox.centerX(), alertBox.top + 48f, textPaint)
 
-            textPaint.typeface = repo.fontSuperSquad
-            textPaint.textSize = 24f
-            textPaint.color = Color.WHITE
-            canvas.drawText("${alert.username}  •  ${alert.subline}", alertBox.centerX(), alertBox.top + 88f, textPaint)
+            drawFitText(
+                canvas,
+                "${alert.username}  •  ${alert.subline}",
+                alertBox.centerX(),
+                alertBox.top + 88f,
+                maxWidth = alertBox.width() - 40f,
+                maxSize = 24f,
+                color = Color.WHITE
+            )
             textPaint.clearShadowLayer()
         }
 
@@ -2005,48 +2559,59 @@ class GameSurfaceView(
                 textPaint
             )
 
-            textPaint.typeface = repo.fontSuperSquad
-            textPaint.textSize = 36f
-            textPaint.color = if (w.playerIndex == 1) Color.rgb(90, 200, 255) else Color.rgb(255, 110, 100)
-            canvas.drawText(
+            drawFitText(
+                canvas,
                 "J${w.playerIndex}: ${w.def.name} (${w.phaseDisplayName.uppercase()})",
                 modal.centerX(),
                 modal.top + 136f,
-                textPaint
+                maxWidth = modal.width() - 50f,
+                maxSize = 34f,
+                color = if (w.playerIndex == 1) Color.rgb(90, 200, 255) else Color.rgb(255, 110, 100)
             )
 
             drawFitBitmap(canvas, repo.getBitmap(w.def.ico), RectF(modal.centerX() - 95f, modal.top + 158f, modal.centerX() + 95f, modal.top + 335f))
 
-            textPaint.textSize = 32f
-            textPaint.color = Color.rgb(255, 165, 45)
-            canvas.drawText(
+            drawFitText(
+                canvas,
                 "🔥 ${if (isEs) "RACHA" else "WIN STREAK"}: ${tiktok.winStreak}  •  RANK ${eng.winnerRank()}",
                 modal.centerX(),
                 modal.top + 388f,
-                textPaint
+                maxWidth = modal.width() - 50f,
+                maxSize = 30f,
+                color = Color.rgb(255, 165, 45)
             )
 
             tiktok.topMvpDonor()?.let { (mvpUser, mvpCoins) ->
-                textPaint.typeface = Typeface.DEFAULT_BOLD
-                textPaint.textSize = 26f
-                textPaint.color = Color.rgb(120, 245, 200)
-                canvas.drawText("🏆 MVP: $mvpUser ($mvpCoins 🪙)", modal.centerX(), modal.top + 436f, textPaint)
+                drawFitText(
+                    canvas,
+                    "🏆 MVP: $mvpUser ($mvpCoins 🪙)",
+                    modal.centerX(),
+                    modal.top + 436f,
+                    maxWidth = modal.width() - 50f,
+                    maxSize = 26f,
+                    color = Color.rgb(120, 245, 200)
+                )
             }
 
             liveNextMatchup?.let { (n1, n2, nSt) ->
-                textPaint.typeface = repo.fontSuperSquad
-                textPaint.textSize = 26f
-                textPaint.color = Color.WHITE
-                canvas.drawText(
+                drawFitText(
+                    canvas,
                     if (isEs) "PRÓXIMO: ${n1.name} vs ${n2.name}" else "NEXT: ${n1.name} vs ${n2.name}",
                     modal.centerX(),
                     modal.top + 492f,
-                    textPaint
+                    maxWidth = modal.width() - 50f,
+                    maxSize = 26f,
+                    color = Color.WHITE
                 )
-                textPaint.typeface = Typeface.DEFAULT_BOLD
-                textPaint.textSize = 22f
-                textPaint.color = Color.LTGRAY
-                canvas.drawText(nSt.name, modal.centerX(), modal.top + 528f, textPaint)
+                drawFitText(
+                    canvas,
+                    nSt.name,
+                    modal.centerX(),
+                    modal.top + 528f,
+                    maxWidth = modal.width() - 50f,
+                    maxSize = 22f,
+                    color = Color.LTGRAY
+                )
             }
 
             val secsLeft = liveRematchTimer.toInt() + 1
@@ -2072,15 +2637,15 @@ class GameSurfaceView(
         canvas.drawLine(0f, ARENA_BOTTOM, VW, ARENA_BOTTOM, strokePaint)
 
         // Header bar inside bottom dashboard (y: 1324..1372)
-        textPaint.typeface = repo.fontSuperSquad
-        textPaint.textSize = 24f
-        textPaint.textAlign = Paint.Align.LEFT
-        textPaint.color = Color.rgb(37, 244, 238)
-        canvas.drawText(
+        drawFitText(
+            canvas,
             if (isEs) "🎁 REGALOS EN VIVO (TOCA PARA PROBAR)" else "🎁 LIVE GIFTS (TAP TO TRIGGER)",
             26f,
             1358f,
-            textPaint
+            maxWidth = 635f,
+            maxSize = 24f,
+            align = Paint.Align.LEFT,
+            color = Color.rgb(37, 244, 238)
         )
 
         // Team Target Pills for quick streamer tap-test
@@ -2121,23 +2686,36 @@ class GameSurfaceView(
             strokePaint.strokeWidth = 2.5f
             canvas.drawRoundRect(r, 14f, 14f, strokePaint)
 
-            textPaint.typeface = repo.fontSuperSquad
-            textPaint.textSize = 20f
-            textPaint.textAlign = Paint.Align.LEFT
-            textPaint.color = Color.WHITE
             val title = if (isEs) g.titleEs else g.titleEn
-            canvas.drawText("${g.icon} $title (${g.coins}🪙)", r.left + 12f, r.top + 32f, textPaint)
+            drawFitText(
+                canvas,
+                "${g.icon} $title (${g.coins}🪙)",
+                r.left + 12f,
+                r.top + 32f,
+                maxWidth = r.width() - 24f,
+                maxSize = 20f,
+                minSize = 15f,
+                align = Paint.Align.LEFT,
+                color = Color.WHITE
+            )
 
-            textPaint.typeface = Typeface.DEFAULT_BOLD
-            textPaint.textSize = 18f
-            textPaint.color = Color.rgb(190, 225, 255)
             val eff = if (isEs) g.effectEs else g.effectEn
-            canvas.drawText(eff, r.left + 12f, r.top + 62f, textPaint)
+            drawFitText(
+                canvas,
+                eff,
+                r.left + 12f,
+                r.top + 62f,
+                maxWidth = r.width() - 24f,
+                maxSize = 18f,
+                minSize = 14f,
+                align = Paint.Align.LEFT,
+                color = Color.rgb(190, 225, 255)
+            )
 
-            clickTargets.add(RectF(r) to {
+            registerClick(r, pad = 6f) {
                 sound.playDecide()
                 tiktok.enqueueGift("@streamer", g.id, 1, g.coins, liveQuickTargetTeam)
-            })
+            }
         }
 
         // Commands Guide Card (left, x: 24..376, y: 1572..1804)
@@ -2148,11 +2726,15 @@ class GameSurfaceView(
         strokePaint.strokeWidth = 2f
         canvas.drawRoundRect(cmdCard, 16f, 16f, strokePaint)
 
-        textPaint.typeface = repo.fontSuperSquad
-        textPaint.textSize = 21f
-        textPaint.textAlign = Paint.Align.CENTER
-        textPaint.color = Color.rgb(255, 210, 65)
-        canvas.drawText(if (isEs) "COMANDOS CHAT" else "CHAT COMMANDS", cmdCard.centerX(), cmdCard.top + 32f, textPaint)
+        drawFitText(
+            canvas,
+            if (isEs) "COMANDOS CHAT" else "CHAT COMMANDS",
+            cmdCard.centerX(),
+            cmdCard.top + 32f,
+            maxWidth = cmdCard.width() - 24f,
+            maxSize = 21f,
+            color = Color.rgb(255, 210, 65)
+        )
 
         val cmdLines = if (isEs) {
             listOf("!j1 / !j2  (elegir equipo)", "!j1 goku  (retador)", "!ki  •  !ssj  •  !curar", "!kaioken  •  !choque", "!tiempo  •  !kame")
@@ -2177,15 +2759,15 @@ class GameSurfaceView(
         strokePaint.strokeWidth = 2f
         canvas.drawRoundRect(feedCard, 16f, 16f, strokePaint)
 
-        textPaint.typeface = repo.fontSuperSquad
-        textPaint.textSize = 21f
-        textPaint.textAlign = Paint.Align.LEFT
-        textPaint.color = Color.rgb(37, 244, 238)
-        canvas.drawText(
+        drawFitText(
+            canvas,
             if (isEs) "💬 ACTIVIDAD DEL DIRECTO (${tiktok.totalCoins}🪙)" else "💬 LIVE ACTIVITY (${tiktok.totalCoins}🪙)",
             feedCard.left + 16f,
             feedCard.top + 32f,
-            textPaint
+            maxWidth = feedCard.width() - 32f,
+            maxSize = 21f,
+            align = Paint.Align.LEFT,
+            color = Color.rgb(37, 244, 238)
         )
 
         canvas.save()

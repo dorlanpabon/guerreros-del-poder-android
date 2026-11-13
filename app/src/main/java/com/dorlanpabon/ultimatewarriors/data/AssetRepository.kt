@@ -160,6 +160,7 @@ class AssetRepository(private val context: Context) {
     val fontGreatFighter: Typeface
     val fontSuperSquad: Typeface
     val fontPointers: Typeface
+    val fontSansBold: Typeface = Typeface.create("sans-serif", Typeface.BOLD)
 
     private val bitmapCache: LruCache<String, Bitmap>
     private val grayCache: LruCache<String, Bitmap>
@@ -296,6 +297,7 @@ class AssetRepository(private val context: Context) {
         return runCatching {
             context.assets.open(path).use { stream ->
                 val opts = BitmapFactory.Options().apply {
+                    inScaled = false
                     inPreferredConfig = Bitmap.Config.ARGB_8888
                     inSampleSize = sampleSize.coerceAtLeast(1)
                 }
@@ -336,6 +338,10 @@ class AssetRepository(private val context: Context) {
             for ((_, anims) in ch.phases) {
                 for ((_, frames) in anims) {
                     paths.addAll(frames)
+                }
+                val sampleFrame = anims.values.firstOrNull()?.firstOrNull()
+                if (sampleFrame != null && sampleFrame.contains('/')) {
+                    paths.add("${sampleFrame.substringBeforeLast('/')}/blast.png")
                 }
             }
         }

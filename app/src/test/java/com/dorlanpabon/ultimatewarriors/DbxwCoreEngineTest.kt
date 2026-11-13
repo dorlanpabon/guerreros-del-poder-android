@@ -193,4 +193,44 @@ class DbxwCoreEngineTest {
         assertEquals(1, mgr.winStreak)
         assertEquals(TikTokGiftKind.GALAXY, mgr.resolveGift("Galaxia", 500))
     }
+
+    @Test
+    fun meleeAttackWidthAndAnimTimingAndOwnerBlastWork() {
+        val fixKChar = characters.first { ch -> ch.cheats.any { it.equals("fixk", true) } }
+        val goku = characters.first { it.folder == "Goku" }
+        val stage = stages.first()
+        val engine = DbxwCoreEngine(fixKChar, goku, stage, GameSettings())
+
+        // Attack animation interval must be snappy (between 0.055s and 0.16s per frame)
+        val kickInterval = fixKChar.statistics.resolvedAttackAnimInterval()
+        assertTrue("Expected snappy attack interval, got $kickInterval", kickInterval in 0.055..0.16)
+
+        // Kicking extends width for fixK fighter and plays kick animation cleanly
+        val origX = engine.p1.x
+        val origW = engine.p1.baseWidth()
+        engine.step(0.016, PlayerInput(kick = true), PlayerInput())
+        assertEquals("kick", engine.p1.currentAnim)
+        assertEquals(144.0, engine.p1.width, 0.01)
+
+        // Standing/idle restores exact position and base width
+        engine.step(0.016, PlayerInput(), PlayerInput())
+        assertEquals(origX, engine.p1.x, 0.01)
+        assertEquals(origW, engine.p1.width, 0.01)
+
+        // Ki blasts record owner's current phase asset directory for character-specific blast.png
+        engine.p2.chargeWidth = 200.0
+        engine.p2.chargeLevel = 2
+        engine.step(0.016, PlayerInput(), PlayerInput(shot = true))
+        val blast = engine.blasts.lastOrNull()
+        assertTrue(blast != null && !blast.ownerAssetDir.isNullOrBlank())
+
+        // Direct on-phone listener accepts @handle cleanly
+        val mgr = TikTokLiveManager(characters, stages)
+        var startedHandle: String? = null
+        mgr.onStartDirectPhoneListener = { h -> startedHandle = h }
+        mgr.startDirectPhoneConnection("@@DorlanTest")
+        assertEquals("DorlanTest", startedHandle)
+        assertEquals("@DorlanTest", mgr.directUsername)
+        assertTrue(mgr.directPhoneEnabled)
+    }
 }

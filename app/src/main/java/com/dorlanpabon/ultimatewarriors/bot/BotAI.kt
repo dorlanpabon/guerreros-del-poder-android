@@ -11,6 +11,8 @@ class BotAI(private val difficulty: Int = 2) {
     private var currentStrategy = Strategy.BALANCED
     private var comboStep = 0
     private var attackPulseTimer = 0.0
+    private var attackHoldTimer = 0.0
+    private var attackHoldIsKick = false
     private var chargeBurstTimer = 0.0
     private var transformCooldown = 2.0
     private var specialCooldown = 1.5
@@ -153,16 +155,29 @@ class BotAI(private val difficulty: Int = 2) {
                 teleportCooldown = 2.2
                 return out
             }
+            if (attackHoldTimer > 0.0) {
+                attackHoldTimer -= dt
+                if (attackHoldIsKick) out.kick = true else out.punch = true
+                return out
+            }
             if (attackPulseTimer <= 0.0) {
                 attackPulseTimer = when (difficulty) {
-                    1 -> 0.30
-                    3 -> 0.11
-                    else -> 0.18
+                    1 -> 0.34
+                    3 -> 0.14
+                    else -> 0.22
                 }
                 comboStep = (comboStep + 1) % 3
-                if (comboStep == 2) out.kick = true else out.punch = true
+                attackHoldIsKick = (comboStep == 2)
+                attackHoldTimer = when (difficulty) {
+                    1 -> 0.14
+                    3 -> 0.18
+                    else -> 0.16
+                }
+                if (attackHoldIsKick) out.kick = true else out.punch = true
             }
             return out
+        } else {
+            attackHoldTimer = 0.0
         }
 
         // 5. Mid/Long range Ki Blast pressure
