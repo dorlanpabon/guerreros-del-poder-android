@@ -9,10 +9,12 @@ import kotlin.random.Random
 class BotAI(private val difficulty: Int = 2) {
     private var decisionTimer = 0.0
     private var currentStrategy = Strategy.BALANCED
-    private var comboStep = 0
     private var attackPulseTimer = 0.0
     private var attackHoldTimer = 0.0
     private var attackHoldIsKick = false
+    private var lastAttackWasKick = false
+    private var blockHoldTimer = 0.0
+    private var blockCooldown = 0.0
     private var rangedActionCooldown = 0.0
     private var chargeBurstTimer = 0.0
     private var transformCooldown = 2.0
@@ -56,6 +58,7 @@ class BotAI(private val difficulty: Int = 2) {
         teleportCooldown -= dt
         jumpCooldown -= dt
         attackPulseTimer -= dt
+        blockCooldown -= dt
         rangedActionCooldown -= dt
 
         // Update PatternAnalyzer
@@ -84,8 +87,50 @@ class BotAI(private val difficulty: Int = 2) {
             it.owner != bot.playerIndex && abs(it.x - bot.x) < 160.0 && abs(it.y - (bot.y + bot.height * 0.4)) < 90.0
         }
 
-        // 1. Defense against incoming blasts or close enemy attacks
-        if (hasIncomingBlast || (enemy.isAttacking && distX < 95.0 && distY < 75.0)) {
+        // Hold active melee attack continuously across frames so multi-move sprites cycle cleanly
+        if (attackHoldTimer > 0.0 && !bot.damagedFlag && !hasIncomingBlast) {
+            if (enemy.isCovering) {
+                attackHoldTimer = 0.0
+                if (bot.chargeWidth >= 55.0 && teleportCooldown <= 0.0 && Random.nextFloat() < 0.45f) {
+                    out.quickTeleportBehind = true
+                    teleportCooldown = 1.8
+                    return out
+                } else if (bot.chargeWidth >= 55.0 && !bot.cheats.hasNoShot(bot.capForm)) {
+                    out.shot = true
+                    attackPulseTimer = 0.08
+                    return out
+                }
+            } else if (distX <= 122.0 && distY <= 92.0) {
+                attackHoldTimer -= dt
+                if (attackHoldIsKick) out.kick = true else out.punch = true
+                if (distX > 42.0) {
+                    if (bot.x < enemy.x) out.right = true else out.left = true
+                }
+                if (attackHoldTimer <= 0.0) {
+                    attackPulseTimer = 0.04
+                }
+                return out
+            } else {
+                attackHoldTimer = 0.0
+            }
+        }
+
+        // 1. Defense against incoming blasts or close enemy attacks (cooldown-gated)
+        if (blockHoldTimer > 0.0) {
+            blockHoldTimer -= dt
+            if (hasIncomingBlast || (enemy.isAttacking && distX < 100.0)) {
+                out.down = true
+                return out
+            } else {
+                blockHoldTimer = 0.0
+            }
+        }
+        if (blockCooldown <= 0.0 && (hasIncomingBlast || (enemy.isAttacking && distX < 92.0 && distY < 75.0))) {
+            blockCooldown = when (difficulty) {
+                1 -> 1.1
+                3 -> 0.55
+                else -> 0.80
+            }
             val blockChance = when (difficulty) {
                 1 -> 0.30
                 3 -> 0.78
@@ -95,7 +140,13 @@ class BotAI(private val difficulty: Int = 2) {
                 out.down = true
                 if (teleportCooldown <= 0.0 && bot.chargeWidth >= 40.0 && Random.nextFloat() < 0.35f) {
                     out.quickTeleportBehind = true
-                    teleportCooldown = 2.0
+                    teleportCooldown = 1.8
+                } else {
+                    blockHoldTimer = when (difficulty) {
+                        1 -> 0.25
+                        3 -> 0.42
+                        else -> 0.34
+                    }
                 }
                 return out
             }
@@ -151,35 +202,23 @@ class BotAI(private val difficulty: Int = 2) {
             }
         }
 
-        // 4. Close Combat (finish active swing even if knockback pushes opponent slightly outside trigger range)
-        if (attackHoldTimer > 0.0 && distY <= 90.0) {
-            attackHoldTimer -= dt
-            if (distX > 56.0) {
-                if (bot.x < enemy.x) out.right = true else out.left = true
-            }
-            if (attackHoldIsKick) out.kick = true else out.punch = true
-            return out
-        }
-        if (distX <= 104.0 && distY <= 84.0) {
+        // 4. Close Combat: initiate long held punch/kick bursts and chain punch <-> kick
+        if (distX <= 108.0 && distY <= 86.0) {
             if (enemy.isCovering && bot.chargeWidth >= 60.0 && Random.nextFloat() < 0.25f && teleportCooldown <= 0.0) {
                 out.quickTeleportBehind = true
                 teleportCooldown = 2.2
                 return out
             }
             if (attackPulseTimer <= 0.0) {
-                attackPulseTimer = when (difficulty) {
-                    1 -> 0.32
-                    3 -> 0.14
-                    else -> 0.20
-                }
-                comboStep = (comboStep + 1) % 3
-                attackHoldIsKick = (comboStep == 2)
+                attackHoldIsKick = if (distY > 30.0) true else !lastAttackWasKick
+                lastAttackWasKick = attackHoldIsKick
                 attackHoldTimer = when (difficulty) {
-                    1 -> 0.15
-                    3 -> 0.19
-                    else -> 0.17
+                    1 -> 0.50
+                    3 -> 0.85
+                    else -> 0.68
                 }
-                if (distX > 56.0) {
+                attackPulseTimer = 0.04
+                if (distX > 42.0) {
                     if (bot.x < enemy.x) out.right = true else out.left = true
                 }
                 if (attackHoldIsKick) out.kick = true else out.punch = true

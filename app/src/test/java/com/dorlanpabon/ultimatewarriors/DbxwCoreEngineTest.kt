@@ -233,4 +233,67 @@ class DbxwCoreEngineTest {
         assertEquals("@DorlanTest", mgr.directUsername)
         assertTrue(mgr.directPhoneEnabled)
     }
+
+    @Test
+    fun botHoldsAttackAndCyclesThroughMultipleAttackFrames() {
+        val goku = characters.first { it.folder == "Goku" }
+        val bardock = characters.first { it.folder == "Bardock" }
+        val stage = stages.first()
+        val engine = DbxwCoreEngine(goku, bardock, stage, GameSettings())
+
+        // 1. Holding punch continuously cycles through multiple distinct punch sprites and preserves frame index across brief idle
+        engine.p1.x = 200.0
+        engine.p2.x = 250.0
+        val seenPunchPaths = linkedSetOf<String>()
+        repeat(35) {
+            engine.step(0.03, PlayerInput(punch = true), PlayerInput())
+            if (engine.p1.currentAnim == "punch") {
+                engine.p1.currentSpritePath()?.let { seenPunchPaths.add(it) }
+            }
+        }
+        assertTrue("Expected at least 5 punch frames, got $seenPunchPaths", seenPunchPaths.size >= 5)
+
+        val lastPunchIdx = engine.p1.animFrameIndex
+        assertTrue("Expected non-zero punch frame before idle, got $lastPunchIdx", lastPunchIdx > 0)
+        engine.step(0.03, PlayerInput(), PlayerInput())
+        assertEquals("stand", engine.p1.currentAnim)
+        engine.step(0.03, PlayerInput(punch = true), PlayerInput())
+        assertEquals("punch", engine.p1.currentAnim)
+        assertTrue(
+            "Expected punch frame to continue from $lastPunchIdx instead of resetting to 0, got ${engine.p1.animFrameIndex}",
+            engine.p1.animFrameIndex == lastPunchIdx || engine.p1.animFrameIndex == lastPunchIdx + 1
+        )
+
+        // 2. Bot in melee range holds punch/kick continuously, alternates attacks, and lands >= 3 combo hits
+        val botEngine = DbxwCoreEngine(bardock, goku, stage, GameSettings())
+        botEngine.p1.x = 280.0
+        botEngine.p2.x = 340.0
+        val bot = BotAI(2)
+        val botSprites = linkedSetOf<String>()
+        val botAnims = linkedSetOf<String>()
+        var consecutivePunchOrKick = 0
+        var maxConsecutiveAttack = 0
+        var maxCombo = 0
+        repeat(140) {
+            val bIn = bot.computeInput(botEngine.p1, botEngine.p2, botEngine, 0.016)
+            if (bIn.punch || bIn.kick) {
+                consecutivePunchOrKick++
+                if (consecutivePunchOrKick > maxConsecutiveAttack) {
+                    maxConsecutiveAttack = consecutivePunchOrKick
+                }
+            } else {
+                consecutivePunchOrKick = 0
+            }
+            botEngine.step(0.016, bIn, PlayerInput())
+            maxCombo = maxOf(maxCombo, botEngine.p1.comboCount)
+            if (botEngine.p1.currentAnim == "punch" || botEngine.p1.currentAnim == "kick") {
+                botAnims.add(botEngine.p1.currentAnim)
+                botEngine.p1.currentSpritePath()?.let { botSprites.add(it) }
+            }
+        }
+        assertTrue("Expected continuous attack hold >= 25 ticks, got $maxConsecutiveAttack", maxConsecutiveAttack >= 25)
+        assertTrue("Expected bot to use both punch and kick, got $botAnims", botAnims.contains("punch") && botAnims.contains("kick"))
+        assertTrue("Expected bot to cycle >= 6 distinct attack sprites, got $botSprites", botSprites.size >= 6)
+        assertTrue("Expected bot to land >= 3 combo hits, got $maxCombo", maxCombo >= 3)
+    }
 }

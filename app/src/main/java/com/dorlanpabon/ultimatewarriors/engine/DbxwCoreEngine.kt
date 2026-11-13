@@ -302,6 +302,8 @@ class FighterState(
     var currentAnim: String = "stand"
     var animFrameIndex: Int = 0
     var animTimer: Double = 0.0
+    val animFrameMap = mutableMapOf<String, Int>()
+    val animStepTimeMap = mutableMapOf<String, Double>()
     var effectFrameIndex: Int = 0
     var effectTimer: Double = 0.0
     var blizzardFrameIndex: Int = 0
@@ -660,19 +662,19 @@ class DbxwCoreEngine(
         if (f.shotCooldown > 0.0) f.shotCooldown = max(0.0, f.shotCooldown - dt)
         if (f.teleportCooldown > 0.0) f.teleportCooldown = max(0.0, f.teleportCooldown - dt)
         if (f.dodgeRollTimer > 0.0) f.dodgeRollTimer = max(0.0, f.dodgeRollTimer - dt)
-        if (f.damagedFlag && elapsedTime - f.damagedTimer >= 0.25) {
+        if (f.damagedFlag && elapsedTime - f.damagedTimer >= 0.20) {
             f.damagedFlag = false
         }
 
         // Knockback deceleration (ManageCriticalState)
         if (f.isCritic) {
-            val decel = 380.0 * dt
+            val decel = 900.0 * dt
             if (f.dx > 0) {
                 f.dx = max(0.0, f.dx - decel)
             } else if (f.dx < 0) {
                 f.dx = min(0.0, f.dx + decel)
             }
-            if (abs(f.dx) < 8.0) {
+            if (abs(f.dx) < 1.0) {
                 f.dx = 0.0
                 f.isCritic = false
                 f.moving = true
@@ -847,7 +849,7 @@ class DbxwCoreEngine(
                 f.fixAttackWidth(isPunch = true, isKick = false)
                 f.moving = false
                 val holdingTowardOpp = (f.facing > 0 && input.right) || (f.facing < 0 && input.left)
-                f.dx = if (holdingTowardOpp && abs(f.x - opp.x) > 52.0) f.facing * f.speed * 0.35 else 0.0
+                f.dx = if (holdingTowardOpp && abs(f.x - opp.x) > 42.0) f.facing * f.speed * 0.45 else 0.0
                 performMeleeStrike(f, opp, isKick = false)
                 animName = if (hasAnim(f, "punch")) "punch" else "kick"
                 animInterval = f.attackAnim
@@ -858,7 +860,7 @@ class DbxwCoreEngine(
                 f.fixAttackWidth(isPunch = false, isKick = true)
                 f.moving = false
                 val holdingTowardOpp = (f.facing > 0 && input.right) || (f.facing < 0 && input.left)
-                f.dx = if (holdingTowardOpp && abs(f.x - opp.x) > 56.0) f.facing * f.speed * 0.35 else 0.0
+                f.dx = if (holdingTowardOpp && abs(f.x - opp.x) > 42.0) f.facing * f.speed * 0.45 else 0.0
                 performMeleeStrike(f, opp, isKick = true)
                 animName = if (hasAnim(f, "kick")) "kick" else "punch"
                 animInterval = f.attackAnim
@@ -1298,14 +1300,13 @@ class DbxwCoreEngine(
                     defender.cheats.recoilless ||
                     attacker.timeJumpActive
                 if (!immune) {
-                    val kbX = 135.0 + sqrt(attacker.comboCount.toDouble()) * 28.0
-                    val kbY = 120.0 + sqrt(attacker.comboCount.toDouble()) * 18.0
+                    val kbX = 50.0 + sqrt(attacker.comboCount.toDouble()) * 10.0
+                    val kbY = 30.0 + sqrt(attacker.comboCount.toDouble()) * 8.0
                     val dir = if (attacker.x <= defender.x) 1.0 else -1.0
                     defender.dx = dir * kbX
-                    defender.dy = -kbY * 1.15
+                    defender.dy = -kbY * 1.2
                     defender.isCritic = true
                     defender.moving = false
-                    defender.isJumping = true
                 }
             }
         }
@@ -1595,17 +1596,28 @@ class DbxwCoreEngine(
 
     private fun advanceSpriteAnim(f: FighterState, anim: String, interval: Double, dt: Double) {
         val targetAnim = if (hasAnim(f, anim)) anim else "stand"
-        if (f.currentAnim != targetAnim) {
-            f.currentAnim = targetAnim
+        val phaseMap = f.def.phases[f.phaseFolder] ?: f.def.phases.values.firstOrNull()
+        val count = phaseMap?.get(targetAnim)?.size ?: 0
+        if (count > 1) {
+            val stepInterval = interval.coerceAtLeast(0.03)
+            val lastStep = f.animStepTimeMap[targetAnim]
+            if (lastStep == null) {
+                f.animStepTimeMap[targetAnim] = elapsedTime
+                val cur = (f.animFrameMap[targetAnim] ?: 0) % count
+                f.animFrameMap[targetAnim] = cur
+                f.animFrameIndex = cur
+            } else if (elapsedTime - lastStep + 1e-9 >= stepInterval) {
+                f.animStepTimeMap[targetAnim] = elapsedTime
+                val next = ((f.animFrameMap[targetAnim] ?: 0) + 1) % count
+                f.animFrameMap[targetAnim] = next
+                f.animFrameIndex = next
+            } else {
+                f.animFrameIndex = (f.animFrameMap[targetAnim] ?: 0) % count
+            }
+        } else {
             f.animFrameIndex = 0
-            f.animTimer = 0.0
-            return
         }
-        f.animTimer += dt
-        if (f.animTimer >= interval.coerceAtLeast(0.03)) {
-            f.animTimer = 0.0
-            f.animFrameIndex++
-        }
+        f.currentAnim = targetAnim
     }
 
     private fun hasAnim(f: FighterState, anim: String): Boolean {
