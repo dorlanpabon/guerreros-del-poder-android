@@ -242,7 +242,8 @@ enum class MatchMode {
     VS_BOT,
     LOCAL_2P,
     BOT_VS_BOT,
-    STORY
+    STORY,
+    TIKTOK_LIVE
 }
 
 enum class ScreenState {
@@ -255,7 +256,8 @@ enum class ScreenState {
     FIGHT,
     VICTORY,
     SETTINGS,
-    CREDITS
+    CREDITS,
+    TIKTOK_HUB
 }
 
 data class WinRecord(

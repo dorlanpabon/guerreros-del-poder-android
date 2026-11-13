@@ -1554,4 +1554,60 @@ class DbxwCoreEngine(
         val w = winnerState()
         return calculateRank(w.dmgAccum, currentRound)
     }
+
+    fun grantCharge(f: FighterState, delta: Double) {
+        addCharge(f, delta)
+    }
+
+    fun healFighter(f: FighterState, ratioOfMax: Double) {
+        if (f.lifeSave <= 0.0) return
+        f.lifeSave = min(f.lifeMax, f.lifeSave + f.lifeMax * ratioOfMax.coerceAtLeast(0.0))
+    }
+
+    fun boostDamaged(f: FighterState, multiplier: Double, cap: Double = 260.0) {
+        f.damaged = min(cap, f.damaged * multiplier)
+    }
+
+    fun triggerKiBarrage(f: FighterState, opp: FighterState, count: Int = 3) {
+        val n = count.coerceIn(1, 5)
+        for (i in 0 until n) {
+            val spreadY = (i - (n - 1) * 0.5) * 22.0
+            val bx = f.x + (if (f.facing >= 0) f.width * 0.78 else f.width * 0.05)
+            val by = (f.y + f.height * 0.32 + spreadY).coerceIn(15.0, WORLD_HEIGHT - 30.0)
+            val oppHurt = opp.hurtbox()
+            val tx = oppHurt[0] + oppHurt[2] * 0.5
+            val ty = oppHurt[1] + oppHurt[3] * 0.5
+            var dxB = tx - bx
+            var dyB = ty - by
+            val len = sqrt(dxB * dxB + dyB * dyB)
+            if (len > 0.001) {
+                dxB /= len
+                dyB /= len
+            } else {
+                dxB = f.facing.toDouble()
+                dyB = 0.0
+            }
+            val angle = atan2(dyB, dxB) * (180.0 / PI)
+            blasts.add(KiBlast(nextEntityId++, f.playerIndex, bx, by, dxB, dyB, angle))
+        }
+        sound.onKiShot()
+    }
+
+    fun forceTackle(f: FighterState) {
+        if (f.isTackling) return
+        f.chargeWidth = max(f.chargeWidth, 200.0)
+        f.chargeLevel = computeChargeLevel(f.chargeWidth)
+        initiateTackle(f)
+    }
+
+    fun forceTransformUltimate(f: FighterState): Boolean {
+        f.chargeWidth = MAX_CHARGE
+        f.chargeLevel = 3
+        if (tryTransformCheat(f)) return true
+        val topNormal = f.def.sortedPhaseNumbers.lastOrNull() ?: return false
+        if (f.capForm < topNormal - 0.001) {
+            return applyNormalPhase(f, topNormal, cost = 0.0)
+        }
+        return false
+    }
 }

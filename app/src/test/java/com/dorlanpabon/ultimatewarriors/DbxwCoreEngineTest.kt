@@ -7,6 +7,9 @@ import com.dorlanpabon.ultimatewarriors.data.ManifestParser
 import com.dorlanpabon.ultimatewarriors.data.StageDefinition
 import com.dorlanpabon.ultimatewarriors.engine.DbxwCoreEngine
 import com.dorlanpabon.ultimatewarriors.engine.PlayerInput
+import com.dorlanpabon.ultimatewarriors.tiktok.TikTokGiftKind
+import com.dorlanpabon.ultimatewarriors.tiktok.TikTokLiveManager
+import com.dorlanpabon.ultimatewarriors.tiktok.TikTokPlayStyle
 import org.json.JSONObject
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -134,5 +137,60 @@ class DbxwCoreEngineTest {
         assertEquals("GOD", DbxwCoreEngine.calculateRank(190000.0, 1))
         assertEquals("S", DbxwCoreEngine.calculateRank(95000.0, 1))
         assertEquals("D", DbxwCoreEngine.calculateRank(10000.0, 1))
+    }
+
+    @Test
+    fun tiktokLiveChatCommandsAndGiftsAndRematchWork() {
+        val goku = characters.first { it.folder == "Goku" }
+        val vegeta = characters.first { it.folder == "Vegeta" }
+        val namek = stages.first { it.folder == "Planet Namek" }
+        val engine = DbxwCoreEngine(goku, vegeta, namek, GameSettings())
+        val mgr = TikTokLiveManager(characters, stages).apply {
+            playStyle = TikTokPlayStyle.AUTO_ARENA
+            simulatorEnabled = false
+        }
+
+        // Character lookup & aliases
+        assertEquals("Freezer", mgr.findCharacterByQuery("frieza")?.folder)
+        assertEquals("Vegetto", mgr.findCharacterByQuery("vegito")?.folder)
+
+        // Chat team bind + challenger queue + !ki + !ssj
+        mgr.enqueueChat("@fan1", "!j1", teamOverride = 0)
+        mgr.enqueueChat("@fan1", "!ki", teamOverride = 1)
+        mgr.enqueueChat("@fan2", "!j2 broly", teamOverride = 2)
+        mgr.processPendingEvents(engine, isSpanish = true)
+
+        assertTrue(engine.p1.chargeWidth > DbxwCoreEngine.MIN_CHARGE)
+        assertEquals(1, mgr.challengerQueue.size)
+        assertEquals("Broly", mgr.challengerQueue.first().character.folder)
+
+        // Rose gift adds Ki and fires blasts
+        val blastsBefore = engine.blasts.size
+        mgr.enqueueGift("@donor1", "rose", 1, 1, teamOverride = 1)
+        mgr.processPendingEvents(engine, isSpanish = true)
+        assertTrue(engine.blasts.size > blastsBefore)
+
+        // Doughnut transforms fighter
+        val formBefore = engine.p1.capForm
+        mgr.enqueueGift("@donor2", "doughnut", 1, 30, teamOverride = 1)
+        mgr.processPendingEvents(engine, isSpanish = true)
+        assertTrue(engine.p1.capForm > formBefore)
+
+        // Galaxy triggers Ultimate phase (MUI for Goku) and full heal
+        engine.p1.lifeSave = engine.p1.lifeMax * 0.2
+        mgr.ingestJsonEvent("""{"type":"gift","user":"@galaxy_king","gift":"galaxy","coins":500,"team":1}""")
+        mgr.processPendingEvents(engine, isSpanish = true)
+        assertEquals("MUI", engine.p1.phaseDisplayName)
+        assertEquals(engine.p1.lifeMax, engine.p1.lifeSave, 0.01)
+        assertEquals(531L, mgr.totalCoins)
+
+        // King of the Hill selects winner + queued challenger (Broly)
+        engine.winnerPlayer = 1
+        engine.matchFinished = true
+        val (nextP1, nextP2, _) = mgr.handleMatchFinished(engine, goku, vegeta, namek)
+        assertEquals("Goku", nextP1.folder)
+        assertEquals("Broly", nextP2.folder)
+        assertEquals(1, mgr.winStreak)
+        assertEquals(TikTokGiftKind.GALAXY, mgr.resolveGift("Galaxia", 500))
     }
 }
