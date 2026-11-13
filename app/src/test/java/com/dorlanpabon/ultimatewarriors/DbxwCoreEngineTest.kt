@@ -224,14 +224,16 @@ class DbxwCoreEngineTest {
         val blast = engine.blasts.lastOrNull()
         assertTrue(blast != null && !blast.ownerAssetDir.isNullOrBlank())
 
-        // Direct on-phone listener accepts @handle cleanly
+        // Direct on-phone listener accepts @handle cleanly without opening network in unit tests
         val mgr = TikTokLiveManager(characters, stages)
+        mgr.eulerStreamEnabled = false
         var startedHandle: String? = null
         mgr.onStartDirectPhoneListener = { h -> startedHandle = h }
         mgr.startDirectPhoneConnection("@@DorlanTest")
         assertEquals("DorlanTest", startedHandle)
         assertEquals("@DorlanTest", mgr.directUsername)
         assertTrue(mgr.directPhoneEnabled)
+        mgr.stopDirectPhoneConnection()
     }
 
     @Test
@@ -295,5 +297,94 @@ class DbxwCoreEngineTest {
         assertTrue("Expected bot to use both punch and kick, got $botAnims", botAnims.contains("punch") && botAnims.contains("kick"))
         assertTrue("Expected bot to cycle >= 6 distinct attack sprites, got $botSprites", botSprites.size >= 6)
         assertTrue("Expected bot to land >= 3 combo hits, got $maxCombo", maxCombo >= 3)
+    }
+
+    @Test
+    fun eulerStreamWebcastSchemaAndDeduplicationWork() {
+        val goku = characters.first { it.folder == "Goku" }
+        val bardock = characters.first { it.folder == "Bardock" }
+        val stage = stages.first()
+        val engine = DbxwCoreEngine(goku, bardock, stage, GameSettings())
+        val mgr = TikTokLiveManager(characters, stages).apply {
+            eulerStreamEnabled = false
+            playStyle = TikTokPlayStyle.AUTO_ARENA
+        }
+
+        // 1. roomInfo + bundled messages (WebcastChatMessage, WebcastGiftMessage, WebcastLikeMessage)
+        mgr.ingestJsonEvent("""{"type":"roomInfo","data":{"userCount":845}}""")
+        assertEquals(845, mgr.viewerCount)
+
+        mgr.ingestJsonEvent(
+            """
+            {
+              "messages": [
+                {
+                  "type": "WebcastChatMessage",
+                  "data": { "user": { "uniqueId": "goku_fan" }, "comment": "!ki", "team": 1 }
+                },
+                {
+                  "type": "WebcastGiftMessage",
+                  "data": {
+                    "user": { "uniqueId": "rose_fan" },
+                    "gift": { "name": "Rose", "diamondCount": 1, "streakable": true },
+                    "repeatCount": 2,
+                    "repeatEnd": 1,
+                    "team": 1
+                  }
+                },
+                {
+                  "type": "WebcastLikeMessage",
+                  "data": { "user": { "uniqueId": "like_fan" }, "likeCount": 15, "team": 2 }
+                }
+              ]
+            }
+            """.trimIndent()
+        )
+        mgr.processPendingEvents(engine, isSpanish = true)
+
+        assertTrue("Expected P1 charge boost from !ki + Rose gift, got ${engine.p1.chargeWidth}", engine.p1.chargeWidth > 0.0)
+        assertTrue("Expected Rose gift barrage blasts", engine.blasts.isNotEmpty())
+        assertEquals(2L, mgr.totalCoins)
+        assertEquals(15L, mgr.totalLikes)
+        val feedBeforeDup = mgr.feedItems.size
+        assertTrue(feedBeforeDup >= 2)
+
+        // 2. Duplicate chat/gift within 2.5s window + unfinished streakable gift (repeatEnd=0) must be suppressed
+        mgr.ingestJsonEvent(
+            """
+            {
+              "messages": [
+                {
+                  "type": "WebcastChatMessage",
+                  "data": { "user": { "uniqueId": "goku_fan" }, "comment": "!ki", "team": 1 }
+                },
+                {
+                  "type": "WebcastGiftMessage",
+                  "data": {
+                    "user": { "uniqueId": "rose_fan" },
+                    "gift": { "name": "Rose", "diamondCount": 1, "streakable": true },
+                    "repeatCount": 2,
+                    "repeatEnd": 1,
+                    "team": 1
+                  }
+                },
+                {
+                  "type": "WebcastGiftMessage",
+                  "data": {
+                    "user": { "uniqueId": "streak_fan" },
+                    "gift": { "name": "Rose", "diamondCount": 1, "streakable": true },
+                    "repeatCount": 1,
+                    "repeatEnd": 0,
+                    "team": 1
+                  }
+                }
+              ]
+            }
+            """.trimIndent()
+        )
+        mgr.processPendingEvents(engine, isSpanish = true)
+
+        assertEquals(2L, mgr.totalCoins)
+        assertEquals(feedBeforeDup, mgr.feedItems.size)
     }
 }

@@ -1,26 +1,27 @@
-# 🎮 Cómo Configurar TikTok Live Interactivo (`v1.0.3+`)
+# 🎮 Cómo Configurar TikTok Live Interactivo (`v1.0.6+`)
 
 Ultimate Warriors Android incluye **3 formas** de conectar tu transmisión en vivo de TikTok para que tu audiencia controle a los peleadores en tiempo real mediante **comentarios**, **regalos (Gifts)** y **likes**.
 
-> Además, siempre puedes probar o entretener la sala usando el **Simulador de Audiencia integrado** en el Hub de TikTok Live sin necesidad de cuenta externa.
+> Además, siempre puedes probar o entretener la sala usando el **Simulador de Audiencia integrado** en el Hub de TikTok Live sin necesidad de cuenta externa. Al llegar el primer comentario o regalo real, el simulador se apaga automáticamente.
 
 ---
 
-## Opción 1: Directo en el mismo teléfono (SIN PC) 📱
+## Opción 1: Directo en el mismo teléfono (SIN PC) — 100% Local Sin API y/o Euler Stream 📱
 
-Es la forma más rápida para transmitir directamente desde tu Android sin usar computador ni programas externos:
+Es la forma más rápida para transmitir directamente desde tu Android sin usar computador ni servidores externos:
 
 1. Abre **TikTok** en tu teléfono (o en otro dispositivo usando tu cuenta) e inicia un **LIVE**.
 2. En **Ultimate Warriors Android**, entra a **🔴 TIKTOK LIVE ARENA**.
 3. En la tarjeta **2. CONEXIÓN EN TELÉFONO, PC Y SIMULADOR**, toca el botón:
    **`📱 CONECTAR @USUARIO EN TELÉFONO`**
-4. Escribe tu nombre de usuario de TikTok (por ejemplo `@dorlanpabon`) y presiona **Guardar y Conectar**.
-5. La app abre un lector silencioso (`1x1 px` en segundo plano) sobre tu directo y escucha el chat y los regalos automáticamente en tiempo real.
-6. Presiona **`🔴 ¡INICIAR DIRECTO TIKTOK!`** y transmite la pantalla de tu celular.
+4. Escribe tu nombre de usuario de TikTok (por ejemplo `@dorlanpabon`) y elige el modo que prefieras:
+   - **Modo 100% Local Sin API (WebView Desktop React Fiber):** Abre `https://www.tiktok.com/@usuario/live` en un lienzo Desktop real (`1280x900`) fuera de pantalla (con audio silenciado sin pausar el stream), inyecta un observador React Fiber + DOM para capturar chat, regalos y espectadores directamente en tu teléfono sin API ni límites externos.
+   - **Euler Stream WebSocket (`wss://ws.eulerstream.com`, Opcional):** Conexión WebSocket nativa de alta fiabilidad usando tu API Key de Euler Stream (configurable en el mismo diálogo). Si activas ambos (**Modo Híbrido Sin PC**), la app deduplica automáticamente mensajes y regalos repetidos.
+5. Presiona **Guardar y Conectar** y luego **`🔴 ¡INICIAR DIRECTO TIKTOK!`**.
 
-### Recomendaciones para Opción 1
-- El botón cambiará a verde **`[LIVE OK]`** cuando la página del directo cargue y detecte el chat.
-- Si TikTok en algún momento solicita verificación captcha o inicio de sesión en el navegador web móvil para tu región/cuenta, usa la **Opción 2 (Termux en el mismo teléfono)** o la **Opción 3 (TikFinity en PC)**.
+### ¿TikTok muestra captcha o verificación en tu región?
+- Dentro del diálogo **Conectar TikTok en Teléfono**, presiona **`👁️ Ver / Diagnosticar Página LIVE`** para traer el navegador integrado al frente de forma interactiva, resolver cualquier captcha o tocar *Watch LIVE*, y luego cerrarlo para que siga escuchando en segundo plano.
+- Si prefieres no abrir el navegador integrado, puedes usar solo **Euler Stream WS** o recurrir a la **Opción 2 (Termux en el mismo teléfono)** o **Opción 3 (TikFinity en PC)**.
 
 ---
 

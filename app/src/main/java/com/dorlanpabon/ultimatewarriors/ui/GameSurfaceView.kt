@@ -2132,10 +2132,10 @@ class GameSurfaceView(
         )
 
         val phoneBtnTitle = if (tiktok.directUsername.isNotBlank()) {
-            val stateLbl = if (tiktok.directPhoneConnected) "LIVE OK" else tiktok.directStatusText
+            val stateLbl = if (tiktok.directPhoneConnected) tiktok.directStatusText.ifBlank { "LIVE OK" } else tiktok.directStatusText
             "📱 ${tiktok.directUsername} [$stateLbl]\n${if (isEs) "Toca para conectar o cambiar usuario" else "Tap to connect or edit user"}"
         } else {
-            if (isEs) "📱 CONECTAR @USUARIO EN TELÉFONO\nEscucha chat y regalos directo sin PC" else "📱 CONNECT @USER ON PHONE\nListen live chat & gifts without PC"
+            if (isEs) "📱 CONECTAR @USUARIO EN TELÉFONO\n100% local sin PC/API o Euler Stream" else "📱 CONNECT @USER ON PHONE\n100% local no-PC/API or Euler Stream"
         }
         drawButton(
             canvas,
@@ -2430,13 +2430,13 @@ class GameSurfaceView(
         if (isEs) {
             drawGuideSection(
                 205f, 540f, Color.rgb(37, 244, 238),
-                "OPCIÓN 1: DIRECTO EN TU TELÉFONO (SIN PC)",
+                "OPCIÓN 1: 100% LOCAL EN TELÉFONO (SIN API/PC) + EULER WS",
                 listOf(
                     "1. Inicia tu Live en TikTok desde tu cuenta (@usuario).",
-                    "2. Toca \"CONECTAR @USUARIO EN TELÉFONO\" y escribe tu usuario.",
-                    "3. El juego lee el chat y regalos en segundo plano directo.",
-                    "4. Si TikTok pide verificación captcha web, usa la Opción 2 o 3.",
-                    "Consejo: Funciona ideal para Arena 24/7 o Streamer vs Chat."
+                    "2. Toca \"CONECTAR @USUARIO EN TELÉFONO\" y escribe tu @usuario.",
+                    "3. Activa WebView Local Desktop (SIN API) y/o Euler Stream WS.",
+                    "4. Si TikTok pide captcha, toca \"👁️ Ver Página LIVE\" y resuélvelo.",
+                    "5. El Simulador se apaga solo al entrar el primer evento real."
                 )
             )
             drawGuideSection(
@@ -2473,13 +2473,13 @@ class GameSurfaceView(
         } else {
             drawGuideSection(
                 205f, 540f, Color.rgb(37, 244, 238),
-                "OPTION 1: DIRECTLY ON YOUR PHONE (NO PC)",
+                "OPTION 1: 100% LOCAL ON PHONE (NO API/PC) + EULER WS",
                 listOf(
                     "1. Start your TikTok Live stream on your account (@username).",
-                    "2. Tap \"CONNECT @USER ON PHONE\" and enter your handle.",
-                    "3. The app reads live chat & gifts in a background web view.",
-                    "4. If TikTok prompts web verification, use Option 2 or 3.",
-                    "Tip: Ideal for 24/7 Arena or Streamer vs Chat modes."
+                    "2. Tap \"CONNECT @USER ON PHONE\" and enter your @username.",
+                    "3. Enable Local Desktop WebView (NO API) and/or Euler Stream WS.",
+                    "4. If TikTok prompts captcha, tap \"👁️ Ver Página LIVE\" to solve it.",
+                    "5. Audience Simulator turns off automatically on real events."
                 )
             )
             drawGuideSection(

@@ -8,13 +8,18 @@ import org.json.JSONObject
 import java.io.BufferedInputStream
 import java.io.ByteArrayOutputStream
 import java.io.InputStream
+import java.io.OutputStream
 import java.net.Inet4Address
 import java.net.NetworkInterface
 import java.net.ServerSocket
 import java.net.Socket
+import java.net.URLEncoder
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.ConcurrentLinkedQueue
 import java.util.concurrent.CopyOnWriteArrayList
+import javax.net.ssl.SNIHostName
+import javax.net.ssl.SSLSocket
+import javax.net.ssl.SSLSocketFactory
 import kotlin.concurrent.thread
 import kotlin.math.max
 import kotlin.math.min
@@ -89,6 +94,12 @@ class TikTokLiveManager(
     private val characters: List<CharDefinition>,
     private val stages: List<StageDefinition>
 ) {
+    companion object {
+        const val DEFAULT_EULER_API_KEY =
+            "euler_MWE1MDIxNzNmNzZmNmFkZmI5OTdkOWI0NDMwNGUxYTJjMGEwNThmYmFmMTc5ZDQyMDQyZGE2"
+        private const val EVENT_DEDUP_WINDOW_MS = 2500L
+    }
+
     var playStyle: TikTokPlayStyle = TikTokPlayStyle.AUTO_ARENA
     var simulatorEnabled: Boolean = true
     var simulatorIntensity: SimulatorIntensity = SimulatorIntensity.HIGH
@@ -98,14 +109,21 @@ class TikTokLiveManager(
     var tikFinityPort: Int = 21213
     var webhookPort: Int = 8765
 
-    // Direct On-Phone WebView TikTok Live Listener state
+    // Direct On-Phone Local WebView + Optional Euler Stream WebSocket
     @Volatile var directUsername: String = ""
     @Volatile var directPhoneEnabled: Boolean = false
     @Volatile var directPhoneConnected: Boolean = false
+    @Volatile var localWebViewEnabled: Boolean = true
+    @Volatile var localWebViewConnected: Boolean = false
+    @Volatile var eulerStreamEnabled: Boolean = true
+    @Volatile var eulerApiKey: String = DEFAULT_EULER_API_KEY
+    @Volatile var eulerConnected: Boolean = false
+    @Volatile var autoDisableSimOnRealEvent: Boolean = true
     @Volatile var directStatusText: String = "Sin configurar"
     var onRequestPhoneConnectDialog: (() -> Unit)? = null
     var onStartDirectPhoneListener: ((String) -> Unit)? = null
     var onStopDirectPhoneListener: (() -> Unit)? = null
+    var onRequestWebViewPreview: (() -> Unit)? = null
 
     @Volatile var webhookRunning: Boolean = false
         private set
@@ -142,7 +160,11 @@ class TikTokLiveManager(
     private var serverSocket: ServerSocket? = null
     private var webhookThread: Thread? = null
     private var tikFinityThread: Thread? = null
+    private var eulerThread: Thread? = null
+    private var eulerSocket: Socket? = null
     @Volatile private var bridgeShouldRun = false
+    @Volatile private var eulerShouldRun = false
+    private val recentEventSignatures = ConcurrentHashMap<String, Long>()
 
     private var simTimer = 0.8
     private var elapsedClock = 0.0
@@ -196,6 +218,7 @@ class TikTokLiveManager(
         bridgeShouldRun = false
         webhookRunning = false
         tikFinityConnected = false
+        stopEulerStreamClient()
         runCatching { serverSocket?.close() }
         serverSocket = null
         webhookThread = null
@@ -220,21 +243,73 @@ class TikTokLiveManager(
         onRequestPhoneConnectDialog?.invoke()
     }
 
+    fun requestWebViewPreview() {
+        onRequestWebViewPreview?.invoke()
+    }
+
+    fun updateDirectConnectionState() {
+        val localOk = localWebViewConnected
+        val eulerOk = eulerConnected
+        directPhoneConnected = localOk || eulerOk
+        if (localOk && eulerOk) {
+            directStatusText = "LIVE Local + Euler OK"
+        } else if (localOk && directStatusText.isBlank()) {
+            directStatusText = "LIVE Local OK"
+        } else if (eulerOk) {
+            directStatusText = "Euler WS LIVE OK"
+        }
+    }
+
     fun startDirectPhoneConnection(rawUser: String) {
         val cleaned = rawUser.trim().trimStart('@').trim()
         if (cleaned.isEmpty()) return
+        stopEulerStreamClient()
+        onStopDirectPhoneListener?.invoke()
+
         directUsername = "@$cleaned"
         directPhoneEnabled = true
+        localWebViewConnected = false
+        eulerConnected = false
         directPhoneConnected = false
-        directStatusText = "Conectando a @$cleaned..."
-        onStartDirectPhoneListener?.invoke(cleaned)
+        directStatusText = when {
+            localWebViewEnabled && eulerStreamEnabled -> "Conectando Local + Euler @$cleaned..."
+            eulerStreamEnabled -> "Conectando Euler WS @$cleaned..."
+            else -> "Conectando WebView Local @$cleaned..."
+        }
+        if (localWebViewEnabled) {
+            onStartDirectPhoneListener?.invoke(cleaned)
+        }
+        if (eulerStreamEnabled && eulerApiKey.isNotBlank()) {
+            startEulerStreamClient(cleaned, eulerApiKey)
+        }
     }
 
     fun stopDirectPhoneConnection() {
         directPhoneEnabled = false
+        localWebViewConnected = false
+        eulerConnected = false
         directPhoneConnected = false
         directStatusText = "Desconectado"
+        stopEulerStreamClient()
         onStopDirectPhoneListener?.invoke()
+    }
+
+    fun startEulerStreamClient(cleanUser: String, apiKey: String = eulerApiKey) {
+        stopEulerStreamClient()
+        if (cleanUser.isBlank() || apiKey.isBlank()) return
+        eulerShouldRun = true
+        eulerThread = thread(start = true, isDaemon = true, name = "UW-EulerStreamWS") {
+            runEulerStreamLoop(cleanUser, apiKey)
+        }
+    }
+
+    fun stopEulerStreamClient() {
+        eulerShouldRun = false
+        eulerConnected = false
+        runCatching { eulerSocket?.close() }
+        eulerSocket = null
+        eulerThread = null
+        updateDirectConnectionState()
     }
 
     fun getLocalIpAddress(): String {
@@ -256,10 +331,26 @@ class TikTokLiveManager(
         }.getOrDefault("127.0.0.1")
     }
 
+    private fun isDuplicateSignature(sig: String): Boolean {
+        val now = System.currentTimeMillis()
+        if (recentEventSignatures.size > 400) {
+            for ((k, ts) in recentEventSignatures) {
+                if (now - ts > EVENT_DEDUP_WINDOW_MS) recentEventSignatures.remove(k, ts)
+            }
+        }
+        val prev = recentEventSignatures[sig]
+        if (prev != null && (now - prev) < EVENT_DEDUP_WINDOW_MS) {
+            return true
+        }
+        recentEventSignatures[sig] = now
+        return false
+    }
+
     fun enqueueChat(username: String, text: String, teamOverride: Int = 0) {
         val cleanUser = normalizeUser(username)
         val cleanText = text.trim()
         if (cleanText.isEmpty()) return
+        if (isDuplicateSignature("C:${cleanUser.lowercase()}:${cleanText.lowercase()}")) return
         eventQueue.add(QueuedTikTokEvent.Chat(cleanUser, cleanText, teamOverride))
     }
 
@@ -271,11 +362,14 @@ class TikTokLiveManager(
         teamOverride: Int = 0
     ) {
         val cleanUser = normalizeUser(username)
+        val cleanGift = giftRaw.trim()
+        val count = repeatCount.coerceIn(1, 99)
+        if (isDuplicateSignature("G:${cleanUser.lowercase()}:${cleanGift.lowercase()}:$count:$coinsOverride")) return
         eventQueue.add(
             QueuedTikTokEvent.Gift(
                 username = cleanUser,
-                giftRaw = giftRaw.trim(),
-                repeatCount = repeatCount.coerceIn(1, 99),
+                giftRaw = cleanGift,
+                repeatCount = count,
                 coinsOverride = coinsOverride,
                 teamOverride = teamOverride
             )
@@ -872,31 +966,189 @@ class TikTokLiveManager(
     fun ingestJsonEvent(rawJson: String) {
         runCatching {
             val obj = JSONObject(rawJson)
-            val type = obj.optString("event", obj.optString("type", "")).lowercase()
-            val data = obj.optJSONObject("data") ?: obj
-            val user = data.optString("user", data.optString("uniqueId", data.optString("nickname", "viewer")))
-            val teamOverride = data.optInt("team", 0)
+            val messages = obj.optJSONArray("messages")
+            if (messages != null) {
+                for (i in 0 until messages.length()) {
+                    val item = messages.optJSONObject(i) ?: continue
+                    ingestSingleJsonObject(item)
+                }
+                return
+            }
+            ingestSingleJsonObject(obj)
+        }
+    }
 
-            when (type) {
-                "chat", "comment" -> {
-                    val text = data.optString("text", data.optString("comment", ""))
-                    enqueueChat(user, text, teamOverride)
-                }
-                "gift" -> {
-                    val giftName = data.optString("gift", data.optString("giftName", "rose"))
-                    val count = data.optInt("count", data.optInt("repeatCount", 1))
-                    val coins = data.optInt("coins", data.optInt("diamondCount", -1))
-                    enqueueGift(user, giftName, count, coins, teamOverride)
-                }
-                "like" -> {
-                    val count = data.optInt("count", data.optInt("likeCount", 1))
-                    enqueueLike(user, count, teamOverride)
-                }
-                "roomuser", "viewers" -> {
-                    val v = data.optInt("viewerCount", viewerCount)
-                    if (v > 0) viewerCount = v
+    private fun ingestSingleJsonObject(obj: JSONObject) {
+        val type = obj.optString("event", obj.optString("type", "")).lowercase()
+        val data = obj.optJSONObject("data") ?: obj
+        val userObj = data.optJSONObject("user")
+        val user = if (userObj != null) {
+            userObj.optString("uniqueId", "").ifBlank {
+                userObj.optString("nickname", "").ifBlank {
+                    userObj.optString("displayId", "viewer")
                 }
             }
+        } else {
+            data.optString("user", data.optString("uniqueId", data.optString("nickname", "viewer")))
+        }
+        val teamOverride = data.optInt("team", obj.optInt("team", 0))
+
+        when (type) {
+            "roominfo" -> {
+                val v = data.optInt("userCount", data.optInt("viewerCount", viewerCount))
+                if (v > 0) viewerCount = v
+            }
+            "chat", "comment", "webcastchatmessage" -> {
+                val text = data.optString("content", data.optString("text", data.optString("comment", "")))
+                enqueueChat(user, text, teamOverride)
+            }
+            "gift", "webcastgiftmessage" -> {
+                val giftObj = data.optJSONObject("gift") ?: data.optJSONObject("giftDetails")
+                val streakable = giftObj != null && (giftObj.optBoolean("streakable", false) || giftObj.optInt("type", 0) == 1)
+                if (streakable && data.has("repeatEnd") && data.optInt("repeatEnd", 1) == 0) {
+                    return
+                }
+                val giftName = giftObj?.optString("name", "")?.ifBlank { giftObj.optString("giftName", "") }
+                    ?: data.optString("gift", data.optString("giftName", "rose"))
+                val count = data.optInt("repeatCount", data.optInt("count", 1)).coerceAtLeast(1)
+                val coins = when {
+                    data.has("coins") -> data.optInt("coins", -1)
+                    data.has("diamondCount") -> data.optInt("diamondCount", -1)
+                    giftObj != null && giftObj.has("diamondCount") -> giftObj.optInt("diamondCount", -1)
+                    else -> -1
+                }
+                enqueueGift(user, giftName.ifBlank { "rose" }, count, coins, teamOverride)
+            }
+            "like", "webcastlikemessage" -> {
+                val count = data.optInt("count", data.optInt("likeCount", 1)).coerceAtLeast(1)
+                enqueueLike(user, count, teamOverride)
+            }
+            "roomuser", "viewers", "webcastroomuserseqmessage", "webcastmembermessage" -> {
+                val v = data.optInt("viewerCount", data.optInt("viewer_count", data.optInt("memberCount", viewerCount)))
+                if (v > 0) viewerCount = v
+            }
+            "webcastsocialmessage" -> {
+                enqueueLike(user, 5, teamOverride)
+            }
+        }
+    }
+
+    // ==================== EULER STREAM TLS WEBSOCKET CLIENT ====================
+
+    private fun runEulerStreamLoop(cleanUser: String, apiKey: String) {
+        while (eulerShouldRun && directPhoneEnabled) {
+            var retryDelayMs = 4500L
+            var fatalStop = false
+            runCatching {
+                val factory = SSLSocketFactory.getDefault() as SSLSocketFactory
+                val sock = factory.createSocket("ws.eulerstream.com", 443) as SSLSocket
+                runCatching {
+                    val params = sock.sslParameters
+                    params.serverNames = listOf(SNIHostName("ws.eulerstream.com"))
+                    sock.sslParameters = params
+                }
+                sock.soTimeout = 35000
+                sock.startHandshake()
+                eulerSocket = sock
+
+                sock.use { tlsSock ->
+                    val encUser = URLEncoder.encode(cleanUser, "UTF-8")
+                    val encKey = URLEncoder.encode(apiKey.trim(), "UTF-8")
+                    val wsKey = encodeBase64(ByteArray(16).also { Random.nextBytes(it) })
+                    val handshake = buildString {
+                        append("GET /?uniqueId=$encUser&apiKey=$encKey&bundleEvents=false HTTP/1.1\r\n")
+                        append("Host: ws.eulerstream.com\r\n")
+                        append("Upgrade: websocket\r\n")
+                        append("Connection: Upgrade\r\n")
+                        append("Sec-WebSocket-Key: $wsKey\r\n")
+                        append("Sec-WebSocket-Version: 13\r\n")
+                        append("User-Agent: UltimateWarriorsAndroid/1.0.6\r\n\r\n")
+                    }
+                    val out = tlsSock.getOutputStream()
+                    out.write(handshake.toByteArray(Charsets.UTF_8))
+                    out.flush()
+
+                    val inp = BufferedInputStream(tlsSock.getInputStream())
+                    val respHeader = readHttpHeader(inp)
+                    if (!respHeader.contains("101")) {
+                        val firstLine = respHeader.lineSequence().firstOrNull()?.trim().orEmpty()
+                        eulerConnected = false
+                        if (!localWebViewConnected) {
+                            directStatusText = if (firstLine.contains("401") || firstLine.contains("403")) {
+                                "Euler Auth error (usa Modo Local)"
+                            } else {
+                                "Euler HTTP: ${firstLine.take(26)}"
+                            }
+                        }
+                        updateDirectConnectionState()
+                        return@use
+                    }
+
+                    eulerConnected = true
+                    updateDirectConnectionState()
+
+                    while (eulerShouldRun && directPhoneEnabled) {
+                        val frame = readWsFrame(inp) ?: break
+                        when (frame.opcode) {
+                            0x9 -> {
+                                // Ping -> Masked Pong (0x8A)
+                                sendWsPong(out, frame.payload)
+                            }
+                            0x8 -> {
+                                val code = if (frame.payload.size >= 2) {
+                                    ((frame.payload[0].toInt() and 0xFF) shl 8) or (frame.payload[1].toInt() and 0xFF)
+                                } else {
+                                    1000
+                                }
+                                eulerConnected = false
+                                when (code) {
+                                    4401 -> {
+                                        if (!localWebViewConnected) directStatusText = "API Key Euler invalida"
+                                        fatalStop = true
+                                    }
+                                    4404 -> {
+                                        if (!localWebViewConnected) directStatusText = "@$cleanUser no esta EN VIVO"
+                                        retryDelayMs = 8500L
+                                    }
+                                    4005 -> {
+                                        if (!localWebViewConnected) directStatusText = "LIVE finalizado"
+                                        retryDelayMs = 8500L
+                                    }
+                                    4429 -> {
+                                        if (!localWebViewConnected) directStatusText = "Limite conexiones Euler"
+                                        retryDelayMs = 10000L
+                                    }
+                                }
+                                updateDirectConnectionState()
+                                break
+                            }
+                            0x1, 0x0 -> {
+                                val msg = String(frame.payload, Charsets.UTF_8)
+                                if (autoDisableSimOnRealEvent &&
+                                    (msg.contains("WebcastChatMessage", true) ||
+                                        msg.contains("WebcastGiftMessage", true) ||
+                                        msg.contains("WebcastLikeMessage", true))
+                                ) {
+                                    simulatorEnabled = false
+                                }
+                                ingestJsonEvent(msg)
+                            }
+                        }
+                    }
+                }
+            }.onFailure {
+                eulerConnected = false
+                if (!localWebViewConnected && directPhoneEnabled && !directStatusText.contains("invalida", true) && !directStatusText.contains("VIVO", true)) {
+                    directStatusText = "Reconectando Euler/Local..."
+                }
+                updateDirectConnectionState()
+            }
+
+            eulerSocket = null
+            eulerConnected = false
+            updateDirectConnectionState()
+            if (fatalStop || !eulerShouldRun || !directPhoneEnabled) break
+            runCatching { Thread.sleep(retryDelayMs) }
         }
     }
 
@@ -927,8 +1179,15 @@ class TikTokLiveManager(
 
                     tikFinityConnected = true
                     while (bridgeShouldRun && tikFinityEnabled) {
-                        val msg = readWsTextFrame(inp) ?: break
-                        ingestJsonEvent(msg)
+                        val frame = readWsFrame(inp) ?: break
+                        if (frame.opcode == 0x8) break
+                        if (frame.opcode == 0x9) {
+                            sendWsPong(out, frame.payload)
+                            continue
+                        }
+                        if (frame.opcode == 0x1 || frame.opcode == 0x0) {
+                            ingestJsonEvent(String(frame.payload, Charsets.UTF_8))
+                        }
                     }
                 }
             }
@@ -936,6 +1195,21 @@ class TikTokLiveManager(
             if (bridgeShouldRun && tikFinityEnabled) {
                 runCatching { Thread.sleep(3000) }
             }
+        }
+    }
+
+    private data class WsFrame(val opcode: Int, val payload: ByteArray)
+
+    private fun sendWsPong(out: OutputStream, payload: ByteArray) {
+        runCatching {
+            val data = if (payload.size > 125) payload.copyOf(125) else payload
+            val mask = ByteArray(4).also { Random.nextBytes(it) }
+            val header = byteArrayOf(0x8A.toByte(), (0x80 or data.size).toByte())
+            out.write(header)
+            out.write(mask)
+            val masked = ByteArray(data.size) { i -> (data[i].toInt() xor mask[i % 4].toInt()).toByte() }
+            out.write(masked)
+            out.flush()
         }
     }
 
@@ -961,13 +1235,12 @@ class TikTokLiveManager(
         return baos.toString("UTF-8")
     }
 
-    private fun readWsTextFrame(inp: InputStream): String? {
+    private fun readWsFrame(inp: InputStream): WsFrame? {
         val b0 = inp.read()
         if (b0 == -1) return null
         val b1 = inp.read()
         if (b1 == -1) return null
         val opcode = b0 and 0x0F
-        if (opcode == 0x8) return null // close frame
         val masked = (b1 and 0x80) != 0
         var len = (b1 and 0x7F).toLong()
         if (len == 126L) {
@@ -997,7 +1270,7 @@ class TikTokLiveManager(
                 payload[i] = (payload[i].toInt() xor mask[i % 4].toInt()).toByte()
             }
         }
-        return String(payload, Charsets.UTF_8)
+        return WsFrame(opcode, payload)
     }
 
     private fun encodeBase64(data: ByteArray): String {
