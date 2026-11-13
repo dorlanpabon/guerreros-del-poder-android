@@ -235,7 +235,7 @@ class FighterState(
     var chargeLevel: Int = 0
 
     // World position & velocity
-    var x: Double = if (playerIndex == 1) 180.0 else 680.0
+    var x: Double = if (playerIndex == 1) 280.0 else 580.0
     var y: Double = DbxwCoreEngine.GROUND_Y_NORMAL
     var dx: Double = 0.0
     var dy: Double = 0.0
@@ -524,7 +524,7 @@ class DbxwCoreEngine(
     }
 
     fun resetRoundPositions() {
-        p1.x = 180.0
+        p1.x = 280.0
         p1.y = p1.groundY()
         p1.dx = 0.0
         p1.dy = 0.0
@@ -543,7 +543,7 @@ class DbxwCoreEngine(
         p1.fixedAttackLeft = Double.NaN
         p1.updateDimensions()
 
-        p2.x = 680.0
+        p2.x = 580.0
         p2.y = p2.groundY()
         p2.dx = 0.0
         p2.dy = 0.0

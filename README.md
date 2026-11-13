@@ -18,6 +18,9 @@ Versión **100% nativa para Android (Kotlin + SurfaceView/Canvas + SoundPool/Med
   - **Modo Historia** (12 capítulos recorriendo las sagas).
   - **🔴 TikTok Live Interactivo (`v1.0.2+` / `v1.0.3`)**: Arena 24/7 (`Chat vs Chat`) y `Streamer vs Chat`, con conexión **directa en el teléfono (`@usuario` sin PC)**, soporte **Termux/Python** (`scripts/tiktok_live_bridge.py`), **TikFinity (`:21213`)** y **Webhook HTTP (`:8765/event`)**. Consulta la guía completa en [**TIKTOK_LIVE_GUIA.md**](TIKTOK_LIVE_GUIA.md).
 
+## Novedades `v1.0.4`
+- **Cámara dinámica de combate (Zoom automático + Hit-Shake)**: encuadre cercano que sigue a ambos luchadores haciendo zoom automáticamente en combate cuerpo a cuerpo (duplicando el tamaño visual en arena para móvil y TikTok Live), anillos de choque en golpes, inicio de ronda más cercano y combos IA ininterrumpidos.
+
 ## Novedades `v1.0.3`
 - **Botones táctiles y menús responsivos**: disparo inmediato en menús/pausa sin perder toques por movimiento mínimo, cola segura entre hilos (`uiCommandQueue`), áreas táctiles ampliadas (`1.38x`) y retención de pulsos en combate (`TouchControls`).
 - **Golpes, patadas y Ki fieles**: animaciones cuerpo a cuerpo sin encogimiento vertical y con alcance extendido hacia el rival (`fixAttackWidth`), *hit-pause*, chispas de impacto más visibles, `blast.png` propio por personaje/fase y contador de combos en arena.

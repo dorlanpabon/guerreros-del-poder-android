@@ -99,6 +99,14 @@ class GameSurfaceView(
     private var liveQuickTargetTeam = 1
     private var tiktokHelpVisible = false
 
+    // Dynamic Close-Up Fighting Camera (follows fighters, zooms in during melee)
+    private var camWorldX = 480f
+    private var camWorldY = 320f
+    private var camViewWorldW = 380f
+    private var camLastRound = -1
+    private var camShakeTimer = 0f
+    private var lastComboSum = 0
+
     private var currentFps = 60
     private var fpsFrameCount = 0
     private var fpsTimer = 0.0
@@ -289,6 +297,9 @@ class GameSurfaceView(
         while (true) {
             val cmd = uiCommandQueue.poll() ?: break
             cmd()
+        }
+        if (camShakeTimer > 0f) {
+            camShakeTimer = max(0f, camShakeTimer - dt.toFloat())
         }
         menuAnimTimer += dt
         if (menuAnimTimer >= 0.1) {
@@ -1139,6 +1150,64 @@ class GameSurfaceView(
         canvas.save()
         canvas.clipRect(arenaRect)
 
+        // Dynamic Fighting Camera framing both fighters up close
+        val p1BaseW = eng.p1.baseWidth()
+        val p2BaseW = eng.p2.baseWidth()
+        val p1CX = (eng.p1.x + if (eng.p1.facing > 0) p1BaseW * 0.5 else eng.p1.width - p1BaseW * 0.5).toFloat()
+        val p2CX = (eng.p2.x + if (eng.p2.facing > 0) p2BaseW * 0.5 else eng.p2.width - p2BaseW * 0.5).toFloat()
+        val p1CY = (eng.p1.y + eng.p1.height * 0.44).toFloat()
+        val p2CY = (eng.p2.y + eng.p2.height * 0.44).toFloat()
+
+        val midX = (p1CX + p2CX) * 0.5f
+        val midY = (p1CY + p2CY) * 0.5f
+        val spanX = abs(p1CX - p2CX)
+        val spanY = abs(p1CY - p2CY)
+
+        val desiredW = max(340f, spanX + 215f)
+        val desiredWFromY = (spanY + 210f) * (VW / ARENA_HEIGHT)
+        val targetViewW = max(desiredW, desiredWFromY).coerceIn(340f, 620f)
+        val targetScale = VW / targetViewW
+        val targetViewH = ARENA_HEIGHT / targetScale
+
+        val worldWidthF = DbxwCoreEngine.WORLD_WIDTH.toFloat()
+        val worldHeightF = DbxwCoreEngine.WORLD_HEIGHT.toFloat()
+        val minCenterX = targetViewW * 0.5f
+        val maxCenterX = max(minCenterX, worldWidthF - targetViewW * 0.5f)
+        val targetX = midX.coerceIn(minCenterX, maxCenterX)
+
+        val minCenterY = targetViewH * 0.5f
+        val maxBottomWorld = max(452f, targetViewH).coerceAtMost(worldHeightF)
+        val maxCenterY = max(minCenterY, maxBottomWorld - targetViewH * 0.5f)
+        val targetY = (midY - targetViewH * 0.05f).coerceIn(minCenterY, maxCenterY)
+
+        if (eng.currentRound != camLastRound || eng.elapsedTime < 0.05) {
+            camViewWorldW = targetViewW
+            camWorldX = targetX
+            camWorldY = targetY
+            camLastRound = eng.currentRound
+            lastComboSum = eng.p1.comboCount + eng.p2.comboCount
+        } else {
+            val lerp = 0.18f
+            camViewWorldW += (targetViewW - camViewWorldW) * lerp
+            camWorldX += (targetX - camWorldX) * lerp
+            camWorldY += (targetY - camWorldY) * lerp
+        }
+
+        val camScale = VW / camViewWorldW
+        val viewWorldH = ARENA_HEIGHT / camScale
+        val camLeft = (camWorldX - camViewWorldW * 0.5f).coerceIn(0f, max(0f, worldWidthF - camViewWorldW))
+        val camTop = (camWorldY - viewWorldH * 0.5f).coerceIn(0f, max(0f, worldHeightF - viewWorldH))
+
+        val comboSum = eng.p1.comboCount + eng.p2.comboCount
+        if (comboSum > lastComboSum) {
+            camShakeTimer = 0.09f
+        }
+        lastComboSum = comboSum
+
+        val shakeMag = if (camShakeTimer > 0f || eng.hitPauseTimer > 0.0) 9f else 0f
+        val shakeX = if (shakeMag > 0f) (Random.nextFloat() * 2f - 1f) * shakeMag else 0f
+        val shakeY = if (shakeMag > 0f) (Random.nextFloat() * 2f - 1f) * shakeMag else 0f
+
         val anyTimeJump = eng.p1.timeJumpActive || eng.p2.timeJumpActive
         val stageBmp = if (anyTimeJump) {
             repo.getGrayscaleBitmap(selectedStage.stageImage) ?: repo.getBitmap(selectedStage.stageImage)
@@ -1147,16 +1216,19 @@ class GameSurfaceView(
         }
 
         if (stageBmp != null) {
-            // Draw stage with horizontal scroll wrap (MoveBackground)
-            val scale = ARENA_HEIGHT / stageBmp.height.toFloat()
-            val scaledW = max(VW * 1.25f, stageBmp.width * scale)
-            val scrollOffset = ((eng.backgroundScrollX % scaledW) + scaledW) % scaledW
-            val x1 = -scrollOffset.toFloat()
-            dstRect.set(x1, ARENA_TOP, x1 + scaledW, ARENA_BOTTOM)
-            canvas.drawBitmap(stageBmp, null, dstRect, bmpPaint)
-            if (x1 + scaledW < VW) {
-                dstRect.set(x1 + scaledW, ARENA_TOP, x1 + scaledW * 2f, ARENA_BOTTOM)
+            // Draw zoomed stage synchronized with camera pan + horizontal scroll wrap
+            val stageH = worldHeightF * camScale
+            val stageTop = ARENA_TOP - camTop * camScale + shakeY
+            val bmpScale = stageH / stageBmp.height.toFloat()
+            val tileW = max(worldWidthF * camScale, stageBmp.width * bmpScale)
+            val rawScroll = (camLeft * 0.72f * camScale) + (eng.backgroundScrollX.toFloat() * camScale)
+            val scrollOffset = ((rawScroll % tileW) + tileW) % tileW
+            var xTile = -scrollOffset + shakeX * 0.5f
+            if (xTile > 0f) xTile -= tileW
+            while (xTile < VW) {
+                dstRect.set(xTile, stageTop, xTile + tileW, stageTop + stageH)
                 canvas.drawBitmap(stageBmp, null, dstRect, bmpPaint)
+                xTile += tileW
             }
         } else {
             fillPaint.color = Color.rgb(24, 34, 62)
@@ -1172,28 +1244,29 @@ class GameSurfaceView(
             }
         }
 
-        // Map world (960 x 540) to vertical arena (1080 x 930)
-        val scaleX = VW / DbxwCoreEngine.WORLD_WIDTH.toFloat()
-        val scaleY = ARENA_HEIGHT / DbxwCoreEngine.WORLD_HEIGHT.toFloat()
-
         // Shadows
         if (repo.settings.shadows && selectedStage.shadow) {
-            drawFighterShadow(canvas, eng.p1, scaleX, scaleY)
-            drawFighterShadow(canvas, eng.p2, scaleX, scaleY)
+            drawFighterShadow(canvas, eng.p1, camLeft, camTop, camScale, shakeX, shakeY)
+            drawFighterShadow(canvas, eng.p2, camLeft, camTop, camScale, shakeX, shakeY)
         }
 
-        // Fighters (draw charging effects, glow, CharEffects, and sprite)
-        drawFighter(canvas, eng.p1, scaleX, scaleY, isFrozen = eng.p2.timeJumpActive)
-        drawFighter(canvas, eng.p2, scaleX, scaleY, isFrozen = eng.p1.timeJumpActive)
+        // Fighters (draw attacker on top so punches/kicks remain clearly visible)
+        if (eng.p1.isAttacking && !eng.p2.isAttacking) {
+            drawFighter(canvas, eng.p2, camLeft, camTop, camScale, shakeX, shakeY, isFrozen = eng.p1.timeJumpActive)
+            drawFighter(canvas, eng.p1, camLeft, camTop, camScale, shakeX, shakeY, isFrozen = eng.p2.timeJumpActive)
+        } else {
+            drawFighter(canvas, eng.p1, camLeft, camTop, camScale, shakeX, shakeY, isFrozen = eng.p2.timeJumpActive)
+            drawFighter(canvas, eng.p2, camLeft, camTop, camScale, shakeX, shakeY, isFrozen = eng.p1.timeJumpActive)
+        }
 
         // Ki Blasts (prefer character-phase custom blast.png, fallback to default blast)
         val defaultBlastBmp = repo.getBitmap("data/resources/GameEffects/blast.png")
         for (b in eng.blasts) {
             val blastBmp = b.ownerAssetDir?.let { repo.getBitmap("$it/blast.png") } ?: defaultBlastBmp
-            val cx = (b.x + b.width * 0.5).toFloat() * scaleX
-            val cy = ARENA_TOP + (b.y + b.height * 0.5).toFloat() * scaleY
-            val bw = b.width.toFloat() * scaleX * 1.45f
-            val bh = b.height.toFloat() * scaleY * 1.45f
+            val cx = ((b.x + b.width * 0.5).toFloat() - camLeft) * camScale + shakeX
+            val cy = ARENA_TOP + ((b.y + b.height * 0.5).toFloat() - camTop) * camScale + shakeY
+            val bw = b.width.toFloat() * camScale * 1.55f
+            val bh = b.height.toFloat() * camScale * 1.55f
             canvas.save()
             canvas.translate(cx, cy)
             canvas.rotate(b.angleDeg.toFloat())
@@ -1207,15 +1280,21 @@ class GameSurfaceView(
             canvas.restore()
         }
 
-        // Explosions & Hit sparks
+        // Explosions & Hit sparks + crisp melee impact shockwave ring
         for (ex in eng.explosions) {
+            val cx = (ex.x.toFloat() - camLeft) * camScale + shakeX
+            val cy = ARENA_TOP + (ex.y.toFloat() - camTop) * camScale + shakeY
+            if (ex.kind == "hit" && ex.frameIndex <= 2) {
+                val ringR = (26f + ex.frameIndex * 18f) * camScale
+                strokePaint.color = if (ex.frameIndex == 0) Color.WHITE else Color.rgb(255, 210, 45)
+                strokePaint.strokeWidth = 5f
+                canvas.drawCircle(cx, cy, ringR, strokePaint)
+            }
             val frames = repo.gameEffectsFrames[ex.kind]
             val path = frames?.getOrNull(ex.frameIndex % frames.size)
             val bmp = repo.getBitmap(path)
             if (bmp != null) {
-                val cx = ex.x.toFloat() * scaleX
-                val cy = ARENA_TOP + ex.y.toFloat() * scaleY
-                val rad = if (ex.kind == "hit") 108f else 132f
+                val rad = (if (ex.kind == "hit") 46f else 62f) * camScale
                 dstRect.set(cx - rad, cy - rad, cx + rad, cy + rad)
                 canvas.drawBitmap(bmp, null, dstRect, pixelPaint)
             }
@@ -1229,20 +1308,20 @@ class GameSurfaceView(
                 val opp = if (f === eng.p1) eng.p2 else eng.p1
                 val hb = f.hurtbox()
                 canvas.drawRect(
-                    hb[0].toFloat() * scaleX,
-                    ARENA_TOP + hb[1].toFloat() * scaleY,
-                    (hb[0] + hb[2]).toFloat() * scaleX,
-                    ARENA_TOP + (hb[1] + hb[3]).toFloat() * scaleY,
+                    (hb[0].toFloat() - camLeft) * camScale + shakeX,
+                    ARENA_TOP + (hb[1].toFloat() - camTop) * camScale + shakeY,
+                    ((hb[0] + hb[2]).toFloat() - camLeft) * camScale + shakeX,
+                    ARENA_TOP + ((hb[1] + hb[3]).toFloat() - camTop) * camScale + shakeY,
                     strokePaint
                 )
                 if (f.isAttacking) {
                     strokePaint.color = Color.RED
                     val ab = f.attackHitbox(opp)
                     canvas.drawRect(
-                        ab[0].toFloat() * scaleX,
-                        ARENA_TOP + ab[1].toFloat() * scaleY,
-                        (ab[0] + ab[2]).toFloat() * scaleX,
-                        ARENA_TOP + (ab[1] + ab[3]).toFloat() * scaleY,
+                        (ab[0].toFloat() - camLeft) * camScale + shakeX,
+                        ARENA_TOP + (ab[1].toFloat() - camTop) * camScale + shakeY,
+                        ((ab[0] + ab[2]).toFloat() - camLeft) * camScale + shakeX,
+                        ARENA_TOP + ((ab[1] + ab[3]).toFloat() - camTop) * camScale + shakeY,
                         strokePaint
                     )
                     strokePaint.color = Color.GREEN
@@ -1319,35 +1398,64 @@ class GameSurfaceView(
         canvas.restore()
     }
 
-    private fun drawFighterShadow(canvas: Canvas, f: FighterState, scaleX: Float, scaleY: Float) {
+    private fun drawFighterShadow(
+        canvas: Canvas,
+        f: FighterState,
+        camLeft: Float,
+        camTop: Float,
+        camScale: Float,
+        shakeX: Float,
+        shakeY: Float
+    ) {
         val baseW = f.baseWidth()
-        val groundScreenY = ARENA_TOP + (f.groundY() + f.height).toFloat() * scaleY - 6f
-        val cx = (f.x + if (f.facing > 0) baseW * 0.5 else f.width - baseW * 0.5).toFloat() * scaleX
+        val groundScreenY = ARENA_TOP + ((f.groundY() + f.height).toFloat() - camTop) * camScale + shakeY - 2f * camScale
+        val cx = ((f.x + if (f.facing > 0) baseW * 0.5 else f.width - baseW * 0.5).toFloat() - camLeft) * camScale + shakeX
         val heightAboveGround = max(0.0, f.groundY() - f.y)
         val factor = (1.0 - heightAboveGround / 300.0).coerceIn(0.35, 1.0).toFloat()
-        val rx = (baseW * 0.45 * factor).toFloat() * scaleX
-        val ry = 14f * factor
+        val rx = (baseW * 0.45 * factor).toFloat() * camScale
+        val ry = 6.5f * factor * camScale
         canvas.drawOval(cx - rx, groundScreenY - ry, cx + rx, groundScreenY + ry, shadowPaint)
     }
 
-    private fun drawFighter(canvas: Canvas, f: FighterState, scaleX: Float, scaleY: Float, isFrozen: Boolean) {
-        val spriteScale = 1.66f
-        val drawH = f.height.toFloat() * spriteScale
-        val drawBottom = ARENA_TOP + (f.y + f.height).toFloat() * scaleY
+    private fun drawFighter(
+        canvas: Canvas,
+        f: FighterState,
+        camLeft: Float,
+        camTop: Float,
+        camScale: Float,
+        shakeX: Float,
+        shakeY: Float,
+        isFrozen: Boolean
+    ) {
+        val drawH = f.height.toFloat() * 1.16f * camScale
+        val drawBottom = ARENA_TOP + ((f.y + f.height).toFloat() - camTop) * camScale + shakeY
         val drawTop = drawBottom - drawH
-        val baseScreenW = f.baseWidth().toFloat() * scaleX
-        val bodyCX = (f.x + if (f.facing > 0) f.baseWidth() * 0.5 else f.width - f.baseWidth() * 0.5).toFloat() * scaleX
+        val baseScreenW = f.baseWidth().toFloat() * camScale
+        val bodyCX = ((f.x + if (f.facing > 0) f.baseWidth() * 0.5 else f.width - f.baseWidth() * 0.5).toFloat() - camLeft) * camScale + shakeX
         val box = RectF(bodyCX - baseScreenW * 0.5f, drawTop, bodyCX + baseScreenW * 0.5f, drawBottom)
+
+        val fxPadX = 16f * camScale
+        val fxPadY = 14f * camScale
 
         // Charging smoke & blizzard
         if (f.isCharging && repo.settings.loadingEffects) {
             val smokeFrames = repo.gameEffectsFrames["smoke_ground"]
             val smokePath = smokeFrames?.getOrNull(f.smokeFrameIndex % smokeFrames.size)
-            drawFitBitmap(canvas, repo.getBitmap(smokePath), RectF(box.left - 35f, box.bottom - 55f, box.right + 35f, box.bottom + 20f), paint = pixelPaint)
+            drawFitBitmap(
+                canvas,
+                repo.getBitmap(smokePath),
+                RectF(box.left - fxPadX, box.bottom - 26f * camScale, box.right + fxPadX, box.bottom + 8f * camScale),
+                paint = pixelPaint
+            )
 
             val blizFrames = repo.gameEffectsFrames["blizzard"]
             val blizPath = blizFrames?.getOrNull(f.blizzardFrameIndex % blizFrames.size)
-            drawFitBitmap(canvas, repo.getBitmap(blizPath), RectF(box.left - 45f, box.top - 40f, box.right + 45f, box.bottom + 25f), paint = pixelPaint)
+            drawFitBitmap(
+                canvas,
+                repo.getBitmap(blizPath),
+                RectF(box.left - 20f * camScale, box.top - 18f * camScale, box.right + 20f * camScale, box.bottom + 10f * camScale),
+                paint = pixelPaint
+            )
         }
 
         // Transformation / Kaioken / TimeJump Glow
@@ -1357,7 +1465,7 @@ class GameSurfaceView(
                 val alpha = ((100f - glow.transparency) / 100f * 185f).toInt().coerceIn(45, 220)
                 glowPaint.color = Color.argb(alpha, Color.red(c), Color.green(c), Color.blue(c))
                 glowPaint.maskFilter = BlurMaskFilter((glow.radius * 5f).coerceIn(10f, 38f), BlurMaskFilter.Blur.NORMAL)
-                canvas.drawOval(box.left - 12f, box.top - 12f, box.right + 12f, box.bottom + 12f, glowPaint)
+                canvas.drawOval(box.left - 6f * camScale, box.top - 6f * camScale, box.right + 6f * camScale, box.bottom + 6f * camScale, glowPaint)
             }
         }
 
@@ -1367,11 +1475,16 @@ class GameSurfaceView(
                 val fxFrames = repo.charEffectsFrames[effectKey]
                 val fxPath = fxFrames?.getOrNull(f.effectFrameIndex % fxFrames.size)
                 val fxBmp = if (isFrozen) repo.getGrayscaleBitmap(fxPath) else repo.getBitmap(fxPath)
-                drawFitBitmap(canvas, fxBmp, RectF(box.left - 28f, box.top - 32f, box.right + 28f, box.bottom + 16f), paint = pixelPaint)
+                drawFitBitmap(
+                    canvas,
+                    fxBmp,
+                    RectF(box.left - fxPadX, box.top - fxPadY, box.right + fxPadX, box.bottom + 8f * camScale),
+                    paint = pixelPaint
+                )
             }
         }
 
-        // Character Sprite (foot-anchored constant height so melee punches/kicks extend without vertical shrinking)
+        // Character Sprite (foot-anchored constant height under dynamic camera zoom)
         val spritePath = f.currentSpritePath()
         val bmp = if (isFrozen) {
             repo.getGrayscaleBitmap(spritePath) ?: repo.getBitmap(spritePath)

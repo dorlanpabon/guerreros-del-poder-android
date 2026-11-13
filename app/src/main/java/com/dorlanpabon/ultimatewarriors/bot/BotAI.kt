@@ -13,6 +13,7 @@ class BotAI(private val difficulty: Int = 2) {
     private var attackPulseTimer = 0.0
     private var attackHoldTimer = 0.0
     private var attackHoldIsKick = false
+    private var rangedActionCooldown = 0.0
     private var chargeBurstTimer = 0.0
     private var transformCooldown = 2.0
     private var specialCooldown = 1.5
@@ -55,6 +56,7 @@ class BotAI(private val difficulty: Int = 2) {
         teleportCooldown -= dt
         jumpCooldown -= dt
         attackPulseTimer -= dt
+        rangedActionCooldown -= dt
 
         // Update PatternAnalyzer
         if (enemy.isAttacking || enemy.isTackling) enemyAggroScore += dt * 2.0 else enemyAggroScore *= 0.99
@@ -140,38 +142,45 @@ class BotAI(private val difficulty: Int = 2) {
             } else {
                 chargeBurstTimer = 0.0
             }
-        } else if (!bot.cheats.android && bot.chargeWidth < 190.0 && distX > 220.0 && currentStrategy != Strategy.AGGRESSIVE) {
-            if (Random.nextFloat() < 0.28f) {
+        } else if (!bot.cheats.android && bot.chargeWidth < 190.0 && distX > 250.0 && rangedActionCooldown <= 0.0 && currentStrategy != Strategy.AGGRESSIVE) {
+            rangedActionCooldown = 0.45
+            if (Random.nextFloat() < 0.35f) {
                 chargeBurstTimer = if (difficulty == 3) 0.9 else 0.65
                 out.charge = true
                 return out
             }
         }
 
-        // 4. Close Combat
-        if (distX <= 92.0 && distY <= 80.0) {
+        // 4. Close Combat (finish active swing even if knockback pushes opponent slightly outside trigger range)
+        if (attackHoldTimer > 0.0 && distY <= 90.0) {
+            attackHoldTimer -= dt
+            if (distX > 56.0) {
+                if (bot.x < enemy.x) out.right = true else out.left = true
+            }
+            if (attackHoldIsKick) out.kick = true else out.punch = true
+            return out
+        }
+        if (distX <= 104.0 && distY <= 84.0) {
             if (enemy.isCovering && bot.chargeWidth >= 60.0 && Random.nextFloat() < 0.25f && teleportCooldown <= 0.0) {
                 out.quickTeleportBehind = true
                 teleportCooldown = 2.2
                 return out
             }
-            if (attackHoldTimer > 0.0) {
-                attackHoldTimer -= dt
-                if (attackHoldIsKick) out.kick = true else out.punch = true
-                return out
-            }
             if (attackPulseTimer <= 0.0) {
                 attackPulseTimer = when (difficulty) {
-                    1 -> 0.34
+                    1 -> 0.32
                     3 -> 0.14
-                    else -> 0.22
+                    else -> 0.20
                 }
                 comboStep = (comboStep + 1) % 3
                 attackHoldIsKick = (comboStep == 2)
                 attackHoldTimer = when (difficulty) {
-                    1 -> 0.14
-                    3 -> 0.18
-                    else -> 0.16
+                    1 -> 0.15
+                    3 -> 0.19
+                    else -> 0.17
+                }
+                if (distX > 56.0) {
+                    if (bot.x < enemy.x) out.right = true else out.left = true
                 }
                 if (attackHoldIsKick) out.kick = true else out.punch = true
             }
@@ -181,11 +190,12 @@ class BotAI(private val difficulty: Int = 2) {
         }
 
         // 5. Mid/Long range Ki Blast pressure
-        if (distX > 160.0 && bot.chargeWidth >= 70.0 && !bot.cheats.hasNoShot(bot.capForm)) {
+        if (distX > 180.0 && bot.chargeWidth >= 70.0 && rangedActionCooldown <= 0.0 && !bot.cheats.hasNoShot(bot.capForm)) {
+            rangedActionCooldown = 0.38
             val shotProb = when (currentStrategy) {
-                Strategy.DEFENSIVE -> 0.14f
-                Strategy.AGGRESSIVE -> 0.09f
-                Strategy.BALANCED -> 0.10f
+                Strategy.DEFENSIVE -> 0.32f
+                Strategy.AGGRESSIVE -> 0.20f
+                Strategy.BALANCED -> 0.25f
             }
             if (Random.nextFloat() < shotProb) {
                 out.shot = true
