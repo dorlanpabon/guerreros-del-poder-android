@@ -1,0 +1,73 @@
+{
+  "slide2": {
+    "Imagen 10": "image2.png"
+  },
+  "slide3": {
+    "Imagen 48": "image4.png",
+    "Imagen 30": "image5.png",
+    "Imagen 6": "image6.png"
+  },
+  "slide6": {
+    "Imagen 8": "image22.png",
+    ".": "image23.png",
+    "kai_f1": "image26.png",
+    "kai_f2": "image26.png",
+    "---": "image60.png",
+    "ico_f1": "image61.png",
+    "ico_f2": "image61.png"
+  },
+  "slide7": {
+    "---": "image86.png"
+  },
+  "slide11": {
+    "ico1_p1": "image94.png",
+    "ico2_p1": "image95.png",
+    "ico3_p1": "image96.png",
+    "ico4_p1": "image97.png",
+    "win1_p1": "image98.png",
+    "win2_p1": "image99.png",
+    "win3_p1": "image100.png",
+    "win4_p1": "image101.png",
+    "ico1_p2": "image94.png",
+    "ico2_p2": "image95.png",
+    "ico3_p2": "image96.png",
+    "ico4_p2": "image97.png",
+    "win1_p2": "image98.png",
+    "win2_p2": "image99.png",
+    "win3_p2": "image100.png",
+    "win4_p2": "image101.png",
+    "inftime": "image102.png",
+    "pollo": "image104.gif"
+  },
+  "slide12": {
+    "ico1_p1": "image94.png",
+    "ico2_p1": "image95.png",
+    "ico3_p1": "image96.png",
+    "ico4_p1": "image97.png",
+    "win1_p1": "image98.png",
+    "win2_p1": "image99.png",
+    "win3_p1": "image100.png",
+    "win4_p1": "image101.png",
+    "ico1_p2": "image94.png",
+    "ico2_p2": "image95.png",
+    "ico3_p2": "image96.png",
+    "ico4_p2": "image97.png",
+    "win1_p2": "image98.png",
+    "win2_p2": "image99.png",
+    "win3_p2": "image100.png",
+    "win4_p2": "image101.png",
+    "inftime": "image102.png",
+    "siguiente": "image112.png",
+    "anterior": "image114.png",
+    "aleatorio": "image116.png",
+    "pause": "image118.png",
+    "stop": "image120.png",
+    "play": "image122.png"
+  },
+  "slide18": {
+    "Teleport": "image89.png",
+    "Result_Bonus": "image89.png",
+    "Result_Rank_2": "image89.png",
+    "Result_Rank_1": "image89.png"
+  }
+}
