@@ -157,6 +157,9 @@ class GameSurfaceView(
         holder.addCallback(this)
         isFocusable = true
         isFocusableInTouchMode = true
+        tiktok.onSpeakTts = { text, flush ->
+            if (tiktok.ttsEnabled) sound.speakTts(text, flush)
+        }
     }
 
     override fun surfaceCreated(holder: SurfaceHolder) {
@@ -322,6 +325,17 @@ class GameSurfaceView(
             }
             ScreenState.FIGHT -> {
                 val eng = engine ?: return
+                if (!paused && matchMode == MatchMode.TIKTOK_LIVE) {
+                    val spawn = tiktok.pendingImmediateSpawn
+                    if (spawn != null) {
+                        tiktok.pendingImmediateSpawn = null
+                        if (spawn.team == 1) p1Char = spawn.character else p2Char = spawn.character
+                        liveNextMatchup = null
+                        liveRematchTimer = 0.0
+                        goToScreen(ScreenState.LOADING)
+                        return
+                    }
+                }
                 if (!paused && !eng.matchFinished) {
                     if (matchMode == MatchMode.TIKTOK_LIVE) {
                         tiktok.step(eng, dt, repo.isSpanish())
@@ -343,22 +357,37 @@ class GameSurfaceView(
                             sound.playResultRank(rank in listOf("GOD", "Z+", "Z", "S+", "S"))
                             if (matchMode == MatchMode.TIKTOK_LIVE && tiktok.autoRematchEnabled) {
                                 liveNextMatchup = tiktok.handleMatchFinished(eng, p1Char, p2Char, selectedStage)
-                                liveRematchTimer = 4.8
+                                liveRematchTimer = if (tiktok.waitingForChallenger) 30.0 else 4.2
                             } else {
                                 screen = ScreenState.VICTORY
                             }
                         }
                     }
                 } else if (!paused && eng.matchFinished && matchMode == MatchMode.TIKTOK_LIVE && tiktok.autoRematchEnabled) {
-                    liveRematchTimer -= dt
-                    if (liveRematchTimer <= 0.0) {
-                        liveNextMatchup?.let { (n1, n2, nSt) ->
-                            p1Char = n1
-                            p2Char = n2
-                            selectedStage = nSt
+                    if (tiktok.waitingForChallenger) {
+                        val timeoutReached = tiktok.stepWaitingForChallenger(eng, dt, repo.isSpanish())
+                        if (timeoutReached) {
+                            tiktok.waitingForChallenger = false
+                            liveNextMatchup?.let { (n1, n2, nSt) ->
+                                p1Char = n1
+                                p2Char = n2
+                                selectedStage = nSt
+                            }
+                            liveNextMatchup = null
+                            goToScreen(ScreenState.LOADING)
                         }
-                        liveNextMatchup = null
-                        goToScreen(ScreenState.LOADING)
+                    } else {
+                        tiktok.processPendingEvents(eng, repo.isSpanish())
+                        liveRematchTimer -= dt
+                        if (liveRematchTimer <= 0.0) {
+                            liveNextMatchup?.let { (n1, n2, nSt) ->
+                                p1Char = n1
+                                p2Char = n2
+                                selectedStage = nSt
+                            }
+                            liveNextMatchup = null
+                            goToScreen(ScreenState.LOADING)
+                        }
                     }
                 }
             }
@@ -1508,6 +1537,43 @@ class GameSurfaceView(
             }
             drawFitBitmap(canvas, bmp, spriteRect, flipX = (f.facing < 0), paint = pixelPaint)
         }
+
+        // Spectator owner tag floating above each fighter in TikTok Live mode
+        if (matchMode == MatchMode.TIKTOK_LIVE) {
+            val isP1 = f.playerIndex == 1
+            val owner = if (isP1) tiktok.p1OwnerUser else tiktok.p2OwnerUser
+            val isReal = if (isP1) tiktok.p1IsRealViewer else tiktok.p2IsRealViewer
+            val wins = if (isReal) tiktok.winsForOwner(owner) else 0
+            val label = buildString {
+                append(if (isP1) "🔵 " else "🔴 ")
+                append(owner.take(16))
+                if (isReal && wins > 0) append(" ★$wins")
+            }
+            val pillW = 216f
+            val pillH = 34f
+            val tagCX = bodyCX.coerceIn(pillW * 0.5f + 12f, VW - pillW * 0.5f - 12f)
+            val tagBottom = (drawTop - 10f).coerceIn(ARENA_TOP + pillH + 14f, ARENA_BOTTOM - 20f)
+            val tagRect = RectF(tagCX - pillW * 0.5f, tagBottom - pillH, tagCX + pillW * 0.5f, tagBottom)
+            fillPaint.color = if (isReal) Color.argb(215, 12, 18, 36) else Color.argb(215, 65, 34, 12)
+            canvas.drawRoundRect(tagRect, 12f, 12f, fillPaint)
+            strokePaint.color = when {
+                !isReal -> Color.rgb(255, 190, 45)
+                isP1 -> Color.rgb(65, 185, 255)
+                else -> Color.rgb(255, 75, 95)
+            }
+            strokePaint.strokeWidth = 2.5f
+            canvas.drawRoundRect(tagRect, 12f, 12f, strokePaint)
+            drawFitText(
+                canvas,
+                label,
+                tagRect.centerX(),
+                tagRect.bottom - 9f,
+                maxWidth = pillW - 18f,
+                maxSize = 20f,
+                minSize = 13f,
+                color = if (isReal) Color.WHITE else Color.rgb(255, 225, 110)
+            )
+        }
     }
 
     private fun drawCombatHud(canvas: Canvas, eng: DbxwCoreEngine) {
@@ -1655,16 +1721,25 @@ class GameSurfaceView(
             canvas.drawCircle(dotX, 160f, 10f, fillPaint)
         }
 
-        // Live Score & Combo Hits
+        // Live Score, Spectator Owner & Combo Hits
+        val ptsText = if (matchMode == MatchMode.TIKTOK_LIVE) {
+            val owner = if (isLeft) tiktok.p1OwnerUser else tiktok.p2OwnerUser
+            val wins = tiktok.winsForOwner(owner)
+            val wSuffix = if (wins > 0) " ★$wins" else ""
+            "$owner$wSuffix • ${f.dmgAccum.toLong()}"
+        } else {
+            "PTS: ${f.dmgAccum.toLong()}"
+        }
         drawFitText(
             canvas,
-            "PTS: ${f.dmgAccum.toLong()}",
+            ptsText,
             lvX,
             206f,
             maxWidth = barWidth,
-            maxSize = 26f,
+            maxSize = 25f,
+            minSize = 16f,
             align = if (isLeft) Paint.Align.LEFT else Paint.Align.RIGHT,
-            color = Color.rgb(255, 225, 120)
+            color = if (matchMode == MatchMode.TIKTOK_LIVE) Color.rgb(125, 235, 255) else Color.rgb(255, 225, 120)
         )
 
         if (f.comboCount > 0) {
@@ -2221,25 +2296,41 @@ class GameSurfaceView(
             }
         }
 
-        // Row D: Difficulty + Roster selector
+        // Row D: Difficulty + TTS Voice Toggle + Roster selector
         drawButton(
             canvas,
-            RectF(54f, 792f, 526f, 868f),
-            if (isEs) "Dificultad IA Bots: Nivel $botDifficulty" else "Bot AI Level: $botDifficulty",
+            RectF(54f, 792f, 366f, 868f),
+            if (isEs) "IA Nivel $botDifficulty" else "Bot Lv.$botDifficulty",
             Color.rgb(42, 62, 108),
             Color.WHITE,
-            24f
+            23f
         ) {
             sound.playUiClick()
             botDifficulty = if (botDifficulty >= 3) 1 else botDifficulty + 1
         }
         drawButton(
             canvas,
-            RectF(548f, 792f, 1026f, 868f),
-            if (isEs) "Elegir Peleadores / Mapa" else "Pick Fighters / Stage",
+            RectF(380f, 792f, 696f, 868f),
+            if (isEs) "🔊 TTS Ánimos: ${if (tiktok.ttsEnabled) "SI" else "NO"}" else "🔊 Voice Cheer: ${if (tiktok.ttsEnabled) "ON" else "OFF"}",
+            if (tiktok.ttsEnabled) Color.rgb(30, 145, 90) else Color.rgb(130, 50, 55),
+            Color.WHITE,
+            22f
+        ) {
+            sound.playUiClick()
+            tiktok.ttsEnabled = !tiktok.ttsEnabled
+            context.getSharedPreferences("uw_tiktok_prefs", Context.MODE_PRIVATE)
+                .edit().putBoolean("tts_enabled", tiktok.ttsEnabled).apply()
+            if (tiktok.ttsEnabled) {
+                tiktok.speakTts("¡Voz animadora activada! Escribe tu personaje para pelear!", flush = true)
+            }
+        }
+        drawButton(
+            canvas,
+            RectF(710f, 792f, 1026f, 868f),
+            if (isEs) "Elegir Pjs / Mapa" else "Pick Fighters",
             Color.rgb(215, 125, 30),
             Color.WHITE,
-            24f
+            23f
         ) {
             matchMode = MatchMode.TIKTOK_LIVE
             goToScreen(ScreenState.CHAR_SELECT)
@@ -2651,92 +2742,158 @@ class GameSurfaceView(
             textPaint.clearShadowLayer()
         }
 
-        // 3. King of the Hill Auto-Rematch End Overlay
-        if (eng.matchFinished && liveRematchTimer > 0.0) {
+        // 3. King of the Hill / Waiting-For-Challenger Post-KO Overlay
+        if (eng.matchFinished && (tiktok.waitingForChallenger || liveRematchTimer > 0.0)) {
             val w = eng.winnerState()
-            val modal = RectF(78f, ARENA_TOP + 140f, VW - 78f, ARENA_BOTTOM - 80f)
-            fillPaint.color = Color.argb(232, 12, 16, 30)
+            val winnerOwner = if (w.playerIndex == 1) tiktok.p1OwnerUser else tiktok.p2OwnerUser
+            val modal = RectF(58f, ARENA_TOP + 62f, VW - 58f, ARENA_BOTTOM - 34f)
+            fillPaint.color = Color.argb(238, 12, 16, 30)
             canvas.drawRoundRect(modal, 28f, 28f, fillPaint)
-            strokePaint.color = Color.rgb(255, 210, 50)
+            strokePaint.color = if (tiktok.waitingForChallenger) Color.rgb(37, 244, 238) else Color.rgb(255, 210, 50)
             strokePaint.strokeWidth = 5f
             canvas.drawRoundRect(modal, 28f, 28f, strokePaint)
 
             textPaint.typeface = repo.fontGreatFighter
-            textPaint.textSize = 54f
+            textPaint.textSize = 48f
             textPaint.textAlign = Paint.Align.CENTER
             textPaint.color = Color.rgb(255, 215, 65)
             canvas.drawText(
-                if (isEs) "👑 REY DE LA ARENA" else "👑 KING OF THE ARENA",
+                if (isEs) "👑 CAMPEÓN: $winnerOwner" else "👑 CHAMPION: $winnerOwner",
                 modal.centerX(),
-                modal.top + 76f,
+                modal.top + 66f,
                 textPaint
             )
 
             drawFitText(
                 canvas,
-                "J${w.playerIndex}: ${w.def.name} (${w.phaseDisplayName.uppercase()})",
+                "J${w.playerIndex}: ${w.def.name} (${w.phaseDisplayName.uppercase()}) • 🔥 RACHA x${tiktok.winStreak}",
                 modal.centerX(),
-                modal.top + 136f,
-                maxWidth = modal.width() - 50f,
-                maxSize = 34f,
+                modal.top + 114f,
+                maxWidth = modal.width() - 48f,
+                maxSize = 27f,
                 color = if (w.playerIndex == 1) Color.rgb(90, 200, 255) else Color.rgb(255, 110, 100)
             )
 
-            drawFitBitmap(canvas, repo.getBitmap(w.def.ico), RectF(modal.centerX() - 95f, modal.top + 158f, modal.centerX() + 95f, modal.top + 335f))
+            drawFitBitmap(canvas, repo.getBitmap(w.def.ico), RectF(modal.centerX() - 80f, modal.top + 132f, modal.centerX() + 80f, modal.top + 286f))
 
-            drawFitText(
-                canvas,
-                "🔥 ${if (isEs) "RACHA" else "WIN STREAK"}: ${tiktok.winStreak}  •  RANK ${eng.winnerRank()}",
-                modal.centerX(),
-                modal.top + 388f,
-                maxWidth = modal.width() - 50f,
-                maxSize = 30f,
-                color = Color.rgb(255, 165, 45)
-            )
+            if (tiktok.waitingForChallenger) {
+                val callout = RectF(modal.left + 26f, modal.top + 302f, modal.right - 26f, modal.bottom - 118f)
+                fillPaint.color = Color.argb(235, 22, 30, 58)
+                canvas.drawRoundRect(callout, 20f, 20f, fillPaint)
+                strokePaint.color = Color.rgb(254, 44, 85)
+                strokePaint.strokeWidth = 3.5f
+                canvas.drawRoundRect(callout, 20f, 20f, strokePaint)
 
-            tiktok.topMvpDonor()?.let { (mvpUser, mvpCoins) ->
                 drawFitText(
                     canvas,
-                    "🏆 MVP: $mvpUser ($mvpCoins 🪙)",
-                    modal.centerX(),
-                    modal.top + 436f,
-                    maxWidth = modal.width() - 50f,
-                    maxSize = 26f,
-                    color = Color.rgb(120, 245, 200)
+                    if (isEs) "⚔️ ¡EL PERDEDOR CAYÓ! ¿QUIÉN ENTRA?" else "⚔️ LOSER IS OUT! WHO'S NEXT?",
+                    callout.centerX(),
+                    callout.top + 48f,
+                    maxWidth = callout.width() - 32f,
+                    maxSize = 31f,
+                    color = Color.rgb(255, 220, 65)
                 )
-            }
-
-            liveNextMatchup?.let { (n1, n2, nSt) ->
                 drawFitText(
                     canvas,
-                    if (isEs) "PRÓXIMO: ${n1.name} vs ${n2.name}" else "NEXT: ${n1.name} vs ${n2.name}",
-                    modal.centerX(),
-                    modal.top + 492f,
-                    maxWidth = modal.width() - 50f,
+                    if (isEs) "✍️ ESCRIBE EL NOMBRE DEL PERSONAJE EN EL CHAT:" else "✍️ TYPE A FIGHTER NAME IN CHAT TO PLAY:",
+                    callout.centerX(),
+                    callout.top + 96f,
+                    maxWidth = callout.width() - 32f,
                     maxSize = 26f,
+                    color = Color.rgb(37, 244, 238)
+                )
+                drawFitText(
+                    canvas,
+                    "GOKU • VEGETA • BROLY • JIREN • GOHAN • GOGETA • VEGETTO",
+                    callout.centerX(),
+                    callout.top + 144f,
+                    maxWidth = callout.width() - 28f,
+                    maxSize = 22f,
                     color = Color.WHITE
                 )
                 drawFitText(
                     canvas,
-                    nSt.name,
-                    modal.centerX(),
-                    modal.top + 528f,
-                    maxWidth = modal.width() - 50f,
+                    "FREEZER • BLACK • BILLS • CELL • BUU • TRUNKS • MORO • 17 • 18",
+                    callout.centerX(),
+                    callout.top + 182f,
+                    maxWidth = callout.width() - 28f,
                     maxSize = 22f,
-                    color = Color.LTGRAY
+                    color = Color.rgb(195, 225, 255)
                 )
-            }
+                drawFitText(
+                    canvas,
+                    if (isEs) "🌹 Envía ROSAS para entrar con tu personaje y darle poder" else "🌹 Send ROSES to enter with your fighter & boost Ki",
+                    callout.centerX(),
+                    callout.top + 230f,
+                    maxWidth = callout.width() - 32f,
+                    maxSize = 23f,
+                    color = Color.rgb(255, 130, 175)
+                )
 
-            val secsLeft = liveRematchTimer.toInt() + 1
-            drawButton(
-                canvas,
-                RectF(modal.left + 90f, modal.bottom - 115f, modal.right - 90f, modal.bottom - 26f),
-                if (isEs) "SIGUIENTE PELEA EN ${secsLeft}s (SALTAR)" else "NEXT FIGHT IN ${secsLeft}s (SKIP)",
-                Color.rgb(225, 45, 85),
-                Color.rgb(37, 244, 238),
-                textSize = 28f
-            ) {
-                liveRematchTimer = 0.01
+                val waitSecs = max(1, tiktok.waitingTimerSec.toInt() + 1)
+                drawButton(
+                    canvas,
+                    RectF(modal.left + 72f, modal.bottom - 98f, modal.right - 72f, modal.bottom - 18f),
+                    if (isEs) "✍️ ESPERANDO CHAT (${waitSecs}s) — TOCA PARA SALTAR" else "✍️ WAITING CHAT (${waitSecs}s) — SKIP",
+                    Color.rgb(225, 45, 85),
+                    Color.rgb(37, 244, 238),
+                    textSize = 25f
+                ) {
+                    tiktok.waitingTimerSec = 0.01
+                }
+            } else {
+                drawFitText(
+                    canvas,
+                    "🔥 ${if (isEs) "RACHA" else "WIN STREAK"}: ${tiktok.winStreak}  •  RANK ${eng.winnerRank()}",
+                    modal.centerX(),
+                    modal.top + 340f,
+                    maxWidth = modal.width() - 50f,
+                    maxSize = 28f,
+                    color = Color.rgb(255, 165, 45)
+                )
+                tiktok.topMvpDonor()?.let { (mvpUser, mvpCoins) ->
+                    drawFitText(
+                        canvas,
+                        "🏆 MVP: $mvpUser ($mvpCoins 🪙)",
+                        modal.centerX(),
+                        modal.top + 388f,
+                        maxWidth = modal.width() - 50f,
+                        maxSize = 25f,
+                        color = Color.rgb(120, 245, 200)
+                    )
+                }
+                liveNextMatchup?.let { (n1, n2, nSt) ->
+                    drawFitText(
+                        canvas,
+                        "PRÓXIMO: ${tiktok.p1OwnerUser} (${n1.name}) vs ${tiktok.p2OwnerUser} (${n2.name})",
+                        modal.centerX(),
+                        modal.top + 448f,
+                        maxWidth = modal.width() - 40f,
+                        maxSize = 24f,
+                        color = Color.WHITE
+                    )
+                    drawFitText(
+                        canvas,
+                        nSt.name,
+                        modal.centerX(),
+                        modal.top + 486f,
+                        maxWidth = modal.width() - 50f,
+                        maxSize = 21f,
+                        color = Color.LTGRAY
+                    )
+                }
+
+                val secsLeft = liveRematchTimer.toInt() + 1
+                drawButton(
+                    canvas,
+                    RectF(modal.left + 90f, modal.bottom - 102f, modal.right - 90f, modal.bottom - 18f),
+                    if (isEs) "SIGUIENTE PELEA EN ${secsLeft}s (SALTAR)" else "NEXT FIGHT IN ${secsLeft}s (SKIP)",
+                    Color.rgb(225, 45, 85),
+                    Color.rgb(37, 244, 238),
+                    textSize = 27f
+                ) {
+                    liveRematchTimer = 0.01
+                }
             }
         }
     }
@@ -2905,43 +3062,59 @@ class GameSurfaceView(
         val simTxt = if (tiktok.simulatorEnabled) "🤖 Sim: ON" else "🤖 Sim: OFF"
         drawButton(
             canvas,
-            RectF(24f, 1818f, 268f, 1900f),
+            RectF(20f, 1818f, 212f, 1900f),
             simTxt,
             if (tiktok.simulatorEnabled) Color.rgb(35, 150, 80) else Color.rgb(120, 48, 52),
             Color.WHITE,
-            21f
+            20f
         ) {
             tiktok.simulatorEnabled = !tiktok.simulatorEnabled
         }
+        val ttsTxt = if (tiktok.ttsEnabled) "🔊 TTS: ON" else "🔇 TTS: OFF"
         drawButton(
             canvas,
-            RectF(282f, 1818f, 558f, 1900f),
-            if (isEs) "🎮 Jugar yo (J1)" else "🎮 Play as P1",
+            RectF(224f, 1818f, 434f, 1900f),
+            ttsTxt,
+            if (tiktok.ttsEnabled) Color.rgb(30, 145, 95) else Color.rgb(110, 50, 58),
+            Color.WHITE,
+            20f
+        ) {
+            tiktok.ttsEnabled = !tiktok.ttsEnabled
+            context.getSharedPreferences("uw_tiktok_prefs", Context.MODE_PRIVATE)
+                .edit().putBoolean("tts_enabled", tiktok.ttsEnabled).apply()
+            if (tiktok.ttsEnabled) {
+                tiktok.speakTts("¡Voz animadora encendida! Escriban su personaje!", flush = true)
+            }
+        }
+        drawButton(
+            canvas,
+            RectF(446f, 1818f, 662f, 1900f),
+            if (isEs) "🎮 Jugar J1" else "🎮 Play P1",
             Color.rgb(38, 105, 195),
             Color.WHITE,
-            21f
+            20f
         ) {
             tiktok.playStyle = TikTokPlayStyle.STREAMER_VS_CHAT
             botP1 = null
         }
         drawButton(
             canvas,
-            RectF(572f, 1818f, 818f, 1900f),
-            if (isEs) "⚡ +Retador" else "⚡ +Challenger",
+            RectF(674f, 1818f, 868f, 1900f),
+            if (isEs) "⚡ +Retador" else "⚡ +Join",
             Color.rgb(130, 65, 190),
             Color.WHITE,
-            21f
+            20f
         ) {
             val rnd = repo.characters.random()
             tiktok.enqueueChat("@streamer", "!j2 ${rnd.folder}", 2)
         }
         drawButton(
             canvas,
-            RectF(832f, 1818f, 1056f, 1900f),
-            if (isEs) "⚙️ Config Live" else "⚙️ Live Hub",
+            RectF(880f, 1818f, 1060f, 1900f),
+            if (isEs) "⚙️ Live Hub" else "⚙️ Live Hub",
             Color.rgb(55, 65, 95),
             Color.WHITE,
-            21f
+            20f
         ) {
             goToScreen(ScreenState.TIKTOK_HUB)
         }

@@ -4,8 +4,10 @@ import android.content.Context
 import android.media.AudioAttributes
 import android.media.MediaPlayer
 import android.media.SoundPool
+import android.speech.tts.TextToSpeech
 import com.dorlanpabon.ultimatewarriors.data.AssetRepository
 import com.dorlanpabon.ultimatewarriors.data.MusicTrack
+import java.util.Locale
 import kotlin.random.Random
 
 class SoundManager(
@@ -19,6 +21,9 @@ class SoundManager(
     private var currentMusicKind: MusicKind = MusicKind.NONE
     private var chargeStreamId = 0
     private var lastChargeTickMs = 0L
+    private var tts: TextToSpeech? = null
+    @Volatile private var ttsReady = false
+    @Volatile private var lastTtsSpokenMs = 0L
 
     enum class MusicKind { NONE, MENU, SELECT, CREDITS, BATTLE }
 
@@ -42,6 +47,51 @@ class SoundManager(
                     }
                 }
             }
+        }
+
+        runCatching {
+            var engineRef: TextToSpeech? = null
+            engineRef = TextToSpeech(context.applicationContext) { status ->
+                if (status == TextToSpeech.SUCCESS) {
+                    val t = engineRef ?: return@TextToSpeech
+                    val mx = Locale("es", "MX")
+                    val es = Locale("es", "ES")
+                    val res = t.setLanguage(mx)
+                    if (res == TextToSpeech.LANG_MISSING_DATA || res == TextToSpeech.LANG_NOT_SUPPORTED) {
+                        val resEs = t.setLanguage(es)
+                        if (resEs == TextToSpeech.LANG_MISSING_DATA || resEs == TextToSpeech.LANG_NOT_SUPPORTED) {
+                            t.setLanguage(Locale.getDefault())
+                        }
+                    }
+                    t.setSpeechRate(1.06f)
+                    t.setPitch(0.98f)
+                    ttsReady = true
+                }
+            }
+            tts = engineRef
+        }
+    }
+
+    fun speakTts(rawText: String, flush: Boolean = false) {
+        val t = tts ?: return
+        if (!ttsReady || rawText.isBlank()) return
+        val now = System.currentTimeMillis()
+        if (!flush && (now - lastTtsSpokenMs) < 3500L) return
+
+        val cleaned = rawText
+            .replace("@", "")
+            .replace("SSJ", "Súper Saiyajin", ignoreCase = true)
+            .replace("J1", "Jugador 1", ignoreCase = false)
+            .replace("J2", "Jugador 2", ignoreCase = false)
+            .replace(Regex("[^\\p{L}\\p{N}\\p{P}\\p{Z}]"), " ")
+            .replace(Regex("\\s+"), " ")
+            .trim()
+        if (cleaned.isEmpty()) return
+
+        lastTtsSpokenMs = now
+        val mode = if (flush) TextToSpeech.QUEUE_FLUSH else TextToSpeech.QUEUE_ADD
+        runCatching {
+            t.speak(cleaned, mode, null, "uw_${now}")
         }
     }
 
@@ -257,5 +307,11 @@ class SoundManager(
     fun release() {
         stopMusicOnly()
         soundPool.release()
+        runCatching {
+            tts?.stop()
+            tts?.shutdown()
+        }
+        tts = null
+        ttsReady = false
     }
 }

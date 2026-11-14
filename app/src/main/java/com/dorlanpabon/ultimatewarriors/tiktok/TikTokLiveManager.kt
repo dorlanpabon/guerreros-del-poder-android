@@ -4,6 +4,7 @@ import com.dorlanpabon.ultimatewarriors.data.CharDefinition
 import com.dorlanpabon.ultimatewarriors.data.StageDefinition
 import com.dorlanpabon.ultimatewarriors.engine.DbxwCoreEngine
 import com.dorlanpabon.ultimatewarriors.engine.FighterState
+import org.json.JSONArray
 import org.json.JSONObject
 import java.io.BufferedInputStream
 import java.io.ByteArrayOutputStream
@@ -78,6 +79,16 @@ data class ChallengerRequest(
     val requestedBy: String
 )
 
+data class SpectatorProfile(
+    val username: String,
+    var characterFolder: String,
+    var wins: Int = 0,
+    var losses: Int = 0,
+    var streak: Int = 0,
+    var coinsGifted: Long = 0L,
+    var preferredTeam: Int = 0
+)
+
 private sealed class QueuedTikTokEvent {
     data class Chat(val username: String, val text: String, val teamOverride: Int) : QueuedTikTokEvent()
     data class Gift(
@@ -125,6 +136,20 @@ class TikTokLiveManager(
     var onStopDirectPhoneListener: (() -> Unit)? = null
     var onRequestWebViewPreview: (() -> Unit)? = null
 
+    // Spectator-as-Player ownership, persistent profiles & TTS announcer
+    @Volatile var p1OwnerUser: String = "@Guerrero_Azul"
+    @Volatile var p2OwnerUser: String = "@Guerrero_Rojo"
+    @Volatile var p1IsRealViewer: Boolean = false
+    @Volatile var p2IsRealViewer: Boolean = false
+    @Volatile var waitingForChallenger: Boolean = false
+    @Volatile var waitingLoserSlot: Int = 2
+    @Volatile var waitingTimerSec: Double = 0.0
+    @Volatile var pendingImmediateSpawn: ChallengerRequest? = null
+    @Volatile var ttsEnabled: Boolean = true
+    var onSpeakTts: ((String, Boolean) -> Unit)? = null
+    var onSaveSpectatorProfiles: ((String) -> Unit)? = null
+    val spectatorProfiles = ConcurrentHashMap<String, SpectatorProfile>()
+
     @Volatile var webhookRunning: Boolean = false
         private set
     @Volatile var tikFinityConnected: Boolean = false
@@ -168,6 +193,7 @@ class TikTokLiveManager(
 
     private var simTimer = 0.8
     private var elapsedClock = 0.0
+    private var ttsCheerTimer = 14.0
     private var nextTeamAssign = 1
     private var nextFeedId = 1L
 
@@ -177,29 +203,70 @@ class TikTokLiveManager(
         "@zamasu_zero", "@jiren_pride", "@trunks_future", "@cell_perfecto"
     )
 
-    private val characterAliases: Map<String, String> = mapOf(
+    private val characterAliases: Map<String, String> = linkedMapOf(
+        "goku black" to "Black",
+        "black goku" to "Black",
+        "super buu" to "SuperBuuGohan",
+        "superbuu" to "SuperBuuGohan",
+        "buuhan" to "SuperBuuGohan",
+        "kid gohan" to "KidGohan",
+        "kidgohan" to "KidGohan",
+        "gohan nino" to "KidGohan",
+        "gohan niño" to "KidGohan",
+        "kid buu" to "KidBuu",
+        "kidbuu" to "KidBuu",
+        "majin buu" to "KidBuu",
+        "android 17" to "Android17",
+        "androide 17" to "Android17",
+        "android17" to "Android17",
+        "numero 17" to "Android17",
+        "android 18" to "Android18",
+        "androide 18" to "Android18",
+        "android18" to "Android18",
+        "numero 18" to "Android18",
+        "android 21" to "Android21",
+        "androide 21" to "Android21",
+        "android21" to "Android21",
+        "numero 21" to "Android21",
         "frieza" to "Freezer",
         "freezer" to "Freezer",
         "vegito" to "Vegetto",
         "vegetto" to "Vegetto",
+        "gogeta" to "Gogeta",
         "bills" to "Beerus",
         "beerus" to "Beerus",
-        "kidbuu" to "KidBuu",
-        "kid buu" to "KidBuu",
+        "bils" to "Beerus",
         "buu" to "KidBuu",
-        "superbuu" to "SuperBuuGohan",
-        "gohan" to "GohanNino",
-        "ssj2 gohan" to "GohanNino",
-        "android17" to "Numero17",
-        "numero 17" to "Numero17",
-        "17" to "Numero17",
-        "android18" to "Numero18",
-        "numero 18" to "Numero18",
-        "18" to "Numero18",
+        "gohan" to "Gohan",
+        "goku" to "Goku",
+        "kakaroto" to "Goku",
+        "vegeta" to "Vegeta",
+        "vegueta" to "Vegeta",
+        "broly" to "Broly",
+        "bardock" to "Bardock",
+        "jiren" to "Jiren",
+        "piccoro" to "Piccolo",
+        "piccolo" to "Piccolo",
+        "pikoro" to "Piccolo",
+        "cell" to "Cell",
+        "celula" to "Cell",
         "cooler" to "Cooler",
         "janemba" to "Janemba",
         "black" to "Black",
-        "goku black" to "Black"
+        "zamasu" to "Zamasu",
+        "zamas" to "Zamasu",
+        "kefla" to "Kefla",
+        "granola" to "Granola",
+        "granolah" to "Granola",
+        "moro" to "Moro",
+        "gotenks" to "Gotenks",
+        "trunks" to "Trunks",
+        "videl" to "Videl",
+        "alex" to "Alex",
+        "hit" to "Hit",
+        "17" to "Android17",
+        "18" to "Android18",
+        "21" to "Android21"
     )
 
     fun startBridgeServers(port: Int = webhookPort) {
@@ -386,9 +453,117 @@ class TikTokLiveManager(
         kingWarriorFolder = ""
         kingTeam = 1
         matchesPlayed = 0
+        waitingForChallenger = false
+        waitingTimerSec = 0.0
+        waitingLoserSlot = 2
+        pendingImmediateSpawn = null
+        p1OwnerUser = "@Guerrero_Azul"
+        p2OwnerUser = "@Guerrero_Rojo"
+        p1IsRealViewer = false
+        p2IsRealViewer = false
+        ttsCheerTimer = 10.0
         challengerQueue.clear()
         feedItems.clear()
         activeAlert = null
+    }
+
+    fun exportSpectatorProfilesJson(): String {
+        val arr = JSONArray()
+        for (prof in spectatorProfiles.values.sortedByDescending { it.wins * 100L + it.coinsGifted }) {
+            val obj = JSONObject()
+            obj.put("username", prof.username)
+            obj.put("characterFolder", prof.characterFolder)
+            obj.put("wins", prof.wins)
+            obj.put("losses", prof.losses)
+            obj.put("streak", prof.streak)
+            obj.put("coinsGifted", prof.coinsGifted)
+            obj.put("preferredTeam", prof.preferredTeam)
+            arr.put(obj)
+        }
+        return arr.toString()
+    }
+
+    fun importSpectatorProfilesJson(rawJson: String?) {
+        if (rawJson.isNullOrBlank()) return
+        runCatching {
+            val arr = JSONArray(rawJson)
+            for (i in 0 until arr.length()) {
+                val obj = arr.optJSONObject(i) ?: continue
+                val user = normalizeUser(obj.optString("username", ""))
+                val charFolder = obj.optString("characterFolder", "")
+                if (charFolder.isBlank()) continue
+                val prof = SpectatorProfile(
+                    username = user,
+                    characterFolder = charFolder,
+                    wins = obj.optInt("wins", 0),
+                    losses = obj.optInt("losses", 0),
+                    streak = obj.optInt("streak", 0),
+                    coinsGifted = obj.optLong("coinsGifted", 0L),
+                    preferredTeam = obj.optInt("preferredTeam", 0)
+                )
+                spectatorProfiles[profileKey(user)] = prof
+                if (prof.preferredTeam in 1..2) {
+                    userTeams[user] = prof.preferredTeam
+                }
+            }
+        }
+    }
+
+    private fun profileKey(username: String): String = normalizeUser(username).lowercase()
+
+    private fun saveSpectatorProfiles() {
+        onSaveSpectatorProfiles?.invoke(exportSpectatorProfilesJson())
+    }
+
+    fun getOrCreateProfile(username: String, defaultCharFolder: String = ""): SpectatorProfile? {
+        val norm = normalizeUser(username)
+        val key = profileKey(norm)
+        val existing = spectatorProfiles[key]
+        if (existing != null) return existing
+        if (defaultCharFolder.isBlank()) return null
+        val created = SpectatorProfile(username = norm, characterFolder = defaultCharFolder)
+        spectatorProfiles[key] = created
+        return created
+    }
+
+    fun winsForOwner(username: String): Int = spectatorProfiles[profileKey(username)]?.wins ?: 0
+
+    private fun isAlreadyActivePlayer(username: String): Boolean {
+        return (p1IsRealViewer && username.equals(p1OwnerUser, ignoreCase = true)) ||
+            (p2IsRealViewer && username.equals(p2OwnerUser, ignoreCase = true))
+    }
+
+    private fun spokenName(username: String): String =
+        username.trim().trimStart('@').replace("_", " ").replace(".", " ")
+
+    fun speakTts(text: String, flush: Boolean = false) {
+        if (ttsEnabled) {
+            onSpeakTts?.invoke(text, flush)
+        }
+    }
+
+    fun stepWaitingForChallenger(engine: DbxwCoreEngine, dt: Double, isSpanish: Boolean): Boolean {
+        elapsedClock += dt
+        activeAlert?.let { alert ->
+            alert.remainingSec -= dt
+            if (alert.remainingSec <= 0.0) activeAlert = null
+        }
+        processPendingEvents(engine, isSpanish)
+        if (!waitingForChallenger) return false
+
+        waitingTimerSec = max(0.0, waitingTimerSec - dt)
+        ttsCheerTimer -= dt
+        if (ttsCheerTimer <= 0.0) {
+            ttsCheerTimer = 11.0
+            val champUser = if (waitingLoserSlot == 2) p1OwnerUser else p2OwnerUser
+            val msg = if (isSpanish) {
+                "¡${spokenName(champUser)} sigue invicto en la arena! Escribe en el chat el nombre de tu personaje, como Goku, Broly, Vegeta, Jiren, Gohan o Freezer, para entrar a pelear ahora mismo, o envía rosas para apoyar."
+            } else {
+                "${spokenName(champUser)} is undefeated! Type a fighter name in chat like Goku, Broly, Vegeta or Jiren to jump in now!"
+            }
+            speakTts(msg, flush = false)
+        }
+        return waitingTimerSec <= 0.0
     }
 
     fun step(engine: DbxwCoreEngine, dt: Double, isSpanish: Boolean) {
@@ -410,6 +585,28 @@ class TikTokLiveManager(
         }
 
         processPendingEvents(engine, isSpanish)
+
+        if (!engine.matchFinished && ttsEnabled) {
+            ttsCheerTimer -= dt
+            if (ttsCheerTimer <= 0.0) {
+                ttsCheerTimer = 22.0
+                val p1Spoken = spokenName(p1OwnerUser)
+                val p2Spoken = spokenName(p2OwnerUser)
+                val msg = if (isSpanish) {
+                    when {
+                        !p1IsRealViewer || !p2IsRealViewer ->
+                            "¡Pelea en vivo! Escribe el nombre de tu personaje en el chat para tomar un puesto y guardar tus victorias, o envía rosas y dale tap tap para subir el poder!"
+                        engine.p1.lifeSave > engine.p2.lifeSave ->
+                            "¡Gran combate entre $p1Spoken y $p2Spoken! $p1Spoken va adelante! Envía rosas o escribe kaioken y curar para apoyar a tu favorito!"
+                        else ->
+                            "¡Duelo intenso entre $p1Spoken y $p2Spoken! $p2Spoken toma la ventaja! Envía rosas o comenta tu personaje para retar al ganador!"
+                    }
+                } else {
+                    "Live battle between $p1Spoken and $p2Spoken! Type a fighter name in chat to join or send roses to power up your fighter!"
+                }
+                speakTts(msg, flush = false)
+            }
+        }
     }
 
     fun processPendingEvents(engine: DbxwCoreEngine, isSpanish: Boolean) {
@@ -439,29 +636,31 @@ class TikTokLiveManager(
             low.startsWith("!j1") || low.startsWith("!p1") || low.startsWith("!azul") || low.startsWith("!blue") -> {
                 team = 1
                 userTeams[ev.username] = 1
+                spectatorProfiles[profileKey(ev.username)]?.preferredTeam = 1
                 val arg = low.substringAfter(" ", "").trim()
                 if (arg.isNotEmpty()) {
-                    tryQueueChallenger(team = 1, query = arg, username = ev.username, isSpanish = isSpanish)
+                    tryQueueChallenger(team = 1, query = arg, username = ev.username, isSpanish = isSpanish, explicitCommand = !waitingForChallenger)
                 } else {
-                    pushFeed(1, ev.username, if (isSpanish) "Se unió al Equipo Azul (J1)" else "Joined Blue Team (P1)")
+                    pushFeed(1, ev.username, if (isSpanish) "Apoya al Equipo Azul (J1)" else "Supports Blue Team (P1)")
                 }
                 return
             }
             low.startsWith("!j2") || low.startsWith("!p2") || low.startsWith("!rojo") || low.startsWith("!red") -> {
                 team = 2
                 userTeams[ev.username] = 2
+                spectatorProfiles[profileKey(ev.username)]?.preferredTeam = 2
                 val arg = low.substringAfter(" ", "").trim()
                 if (arg.isNotEmpty()) {
-                    tryQueueChallenger(team = 2, query = arg, username = ev.username, isSpanish = isSpanish)
+                    tryQueueChallenger(team = 2, query = arg, username = ev.username, isSpanish = isSpanish, explicitCommand = !waitingForChallenger)
                 } else {
-                    pushFeed(2, ev.username, if (isSpanish) "Se unió al Equipo Rojo (J2)" else "Joined Red Team (P2)")
+                    pushFeed(2, ev.username, if (isSpanish) "Apoya al Equipo Rojo (J2)" else "Supports Red Team (P2)")
                 }
                 return
             }
             low.startsWith("!retador ") || low.startsWith("!vs ") || low.startsWith("!pick ") -> {
                 val arg = low.substringAfter(" ", "").trim()
                 val slot = if (playStyle == TikTokPlayStyle.STREAMER_VS_CHAT) 2 else team
-                tryQueueChallenger(slot, arg, ev.username, isSpanish)
+                tryQueueChallenger(slot, arg, ev.username, isSpanish = isSpanish, explicitCommand = !waitingForChallenger)
                 return
             }
         }
@@ -469,12 +668,32 @@ class TikTokLiveManager(
         val fighter = fighterForTeam(engine, team)
         val opp = opponentForTeam(engine, team)
 
-        // Direct character vote without prefix
-        val directChar = findCharacterByQuery(low)
-        if (directChar != null && !low.startsWith("!")) {
-            val slot = if (playStyle == TikTokPlayStyle.STREAMER_VS_CHAT) 2 else team
-            enqueueChallenger(slot, directChar, ev.username, isSpanish)
+        // Direct character vote or natural phrase without '!' prefix -> spectator joins/saves fighter
+        val directChar = if (!low.startsWith("!")) findCharacterByQuery(low) else null
+        if (directChar != null) {
+            val preferred = if (ev.teamOverride in 1..2) ev.teamOverride else if (playStyle == TikTokPlayStyle.STREAMER_VS_CHAT) 2 else 0
+            claimOrQueueCharacter(ev.username, directChar, preferredSlot = preferred, explicitCommand = false, isSpanish = isSpanish)
             return
+        }
+
+        // Cheering / supporting active players by @username or "apoyo j1/j2"
+        if (!low.startsWith("!")) {
+            val p1Handle = spokenName(p1OwnerUser).lowercase()
+            val p2Handle = spokenName(p2OwnerUser).lowercase()
+            when {
+                (p1Handle.length >= 3 && low.contains(p1Handle)) || low.contains("azul") || low.contains("j1") -> {
+                    userTeams[ev.username] = 1
+                    spectatorProfiles[profileKey(ev.username)]?.preferredTeam = 1
+                    pushFeed(1, ev.username, if (isSpanish) "Apoya a $p1OwnerUser (J1)" else "Cheering for $p1OwnerUser (P1)")
+                    return
+                }
+                (p2Handle.length >= 3 && low.contains(p2Handle)) || low.contains("rojo") || low.contains("j2") -> {
+                    userTeams[ev.username] = 2
+                    spectatorProfiles[profileKey(ev.username)]?.preferredTeam = 2
+                    pushFeed(2, ev.username, if (isSpanish) "Apoya a $p2OwnerUser (J2)" else "Cheering for $p2OwnerUser (P2)")
+                    return
+                }
+            }
         }
 
         // Combat chat commands (throttled per user to avoid spam)
@@ -554,16 +773,51 @@ class TikTokLiveManager(
         }
     }
 
-    private fun handleGift(engine: DbxwCoreEngine, ev: QueuedTikTokEvent.Gift, isSpanish: Boolean) {
-        val team = if (ev.teamOverride in 1..2) {
-            userTeams[ev.username] = ev.teamOverride
-            ev.teamOverride
-        } else {
-            resolveOrAssignUserTeam(ev.username)
+    private fun resolveSupporterTeam(username: String, teamOverride: Int): Int {
+        if (teamOverride in 1..2) {
+            userTeams[username] = teamOverride
+            spectatorProfiles[profileKey(username)]?.preferredTeam = teamOverride
+            return teamOverride
         }
+        if (username.equals(p1OwnerUser, ignoreCase = true)) return 1
+        if (username.equals(p2OwnerUser, ignoreCase = true)) return 2
+        spectatorProfiles[profileKey(username)]?.preferredTeam?.let { pref ->
+            if (pref in 1..2) return pref
+        }
+        return resolveOrAssignUserTeam(username)
+    }
+
+    private fun handleGift(engine: DbxwCoreEngine, ev: QueuedTikTokEvent.Gift, isSpanish: Boolean) {
         val gift = resolveGift(ev.giftRaw, ev.coinsOverride)
         val count = ev.repeatCount.coerceAtLeast(1)
         val coins = if (ev.coinsOverride > 0) ev.coinsOverride * count else gift.coins * count
+
+        // Update donor's persistent coin total
+        val prof = spectatorProfiles[profileKey(ev.username)]
+        if (prof != null) {
+            prof.coinsGifted += coins
+            saveSpectatorProfiles()
+        }
+
+        // If arena is waiting for a new challenger after a loss, allow a non-champion viewer with a gift to enter immediately
+        val champOwner = if (waitingLoserSlot == 2) p1OwnerUser else p2OwnerUser
+        if (waitingForChallenger && !ev.username.equals(champOwner, ignoreCase = true)) {
+            val savedChar = prof?.characterFolder?.let { findCharacterByQuery(it) }
+                ?: pickRandomChallenger(exclude = fighterForTeam(engine, if (waitingLoserSlot == 2) 1 else 2).def)
+            claimOrQueueCharacter(ev.username, savedChar, preferredSlot = waitingLoserSlot, explicitCommand = false, isSpanish = isSpanish)
+        }
+
+        val team = resolveSupporterTeam(ev.username, ev.teamOverride)
+        if (prof == null && team in 1..2) {
+            val teamFighterFolder = fighterForTeam(engine, team).def.folder
+            spectatorProfiles[profileKey(ev.username)] = SpectatorProfile(
+                username = ev.username,
+                characterFolder = teamFighterFolder,
+                coinsGifted = coins.toLong(),
+                preferredTeam = team
+            )
+            saveSpectatorProfiles()
+        }
 
         totalCoins += coins
         if (team == 1) team1Coins += coins else team2Coins += coins
@@ -622,19 +876,26 @@ class TikTokLiveManager(
         val effText = if (isSpanish) gift.effectEs else gift.effectEn
         val multStr = if (count > 1) " x$count" else ""
         val teamTag = if (team == 1) "J1" else "J2"
-        pushFeed(team, ev.username, "${gift.icon} $giftTitle$multStr -> $teamTag ($effText)", isGift = true)
+        val ownerSupported = if (team == 1) p1OwnerUser else p2OwnerUser
+        pushFeed(team, ev.username, "${gift.icon} $giftTitle$multStr -> $ownerSupported ($effText)", isGift = true)
         showAlert(
             team = team,
             username = ev.username,
             headline = "${gift.icon} ${giftTitle.uppercase()}$multStr",
-            subline = "$teamTag ${fighter.def.name}: $effText",
+            subline = "$ownerSupported (${fighter.def.name}): $effText",
             giftKind = gift,
             durationSec = if (gift.coins >= 99) 3.4 else 2.4
         )
+        val ttsGift = if (isSpanish) {
+            "¡Gracias ${spokenName(ev.username)} por ${if (count > 1) "$count " else ""}$giftTitle! Apoya a ${spokenName(ownerSupported)} con ${fighter.def.name}!"
+        } else {
+            "Thank you ${spokenName(ev.username)} for the $giftTitle supporting ${spokenName(ownerSupported)}!"
+        }
+        speakTts(ttsGift, flush = gift.coins >= 30)
     }
 
     private fun handleLike(engine: DbxwCoreEngine, ev: QueuedTikTokEvent.Like) {
-        val team = if (ev.teamOverride in 1..2) ev.teamOverride else resolveOrAssignUserTeam(ev.username)
+        val team = resolveSupporterTeam(ev.username, ev.teamOverride)
         totalLikes += ev.count
         if (team == 1) team1Likes += ev.count else team2Likes += ev.count
 
@@ -659,19 +920,39 @@ class TikTokLiveManager(
     }
 
     fun findCharacterByQuery(rawQuery: String): CharDefinition? {
-        val q = rawQuery.lowercase().trim()
-        if (q.length < 2) return null
-        val aliasFolder = characterAliases[q]
-        if (aliasFolder != null) {
-            characters.firstOrNull { it.folder.equals(aliasFolder, true) }?.let { return it }
+        val cleaned = rawQuery.lowercase()
+            .replace(Regex("[!?.,:;¿¡\"'()\\[\\]]"), " ")
+            .replace(Regex("\\s+"), " ")
+            .trim()
+        if (cleaned.length < 2) return null
+
+        // 1. Exact alias or folder/name match
+        characterAliases[cleaned]?.let { folder ->
+            characters.firstOrNull { it.folder.equals(folder, true) }?.let { return it }
         }
         characters.firstOrNull {
-            it.folder.equals(q, true) || it.name.equals(q, true)
+            it.folder.equals(cleaned, true) || it.name.equals(cleaned, true)
         }?.let { return it }
 
-        if (q.length >= 3) {
+        // 2. Whole-word match inside sentences (longest aliases/names first)
+        for ((alias, folder) in characterAliases.entries.sortedByDescending { it.key.length }) {
+            val rx = Regex("(^|\\s)${Regex.escape(alias)}(\\s|$)")
+            if (rx.containsMatchIn(cleaned)) {
+                characters.firstOrNull { it.folder.equals(folder, true) }?.let { return it }
+            }
+        }
+        for (ch in characters.sortedByDescending { max(it.name.length, it.folder.length) }) {
+            val rxFolder = Regex("(^|\\s)${Regex.escape(ch.folder.lowercase())}(\\s|$)")
+            val rxName = Regex("(^|\\s)${Regex.escape(ch.name.lowercase())}(\\s|$)")
+            if (rxFolder.containsMatchIn(cleaned) || rxName.containsMatchIn(cleaned)) {
+                return ch
+            }
+        }
+
+        // 3. Partial substring match only for single-token / short queries >= 3 chars
+        if (cleaned.length >= 3 && !cleaned.contains(' ')) {
             characters.firstOrNull {
-                it.name.lowercase().contains(q) || it.folder.lowercase().contains(q)
+                it.name.lowercase().contains(cleaned) || it.folder.lowercase().contains(cleaned)
             }?.let { return it }
         }
         return null
@@ -686,7 +967,28 @@ class TikTokLiveManager(
         matchesPlayed++
         val winner = engine.winnerState()
         val winnerSlot = winner.playerIndex
+        val loserSlot = if (winnerSlot == 1) 2 else 1
         val winnerChar = winner.def
+
+        // Update persistent win/loss profiles for spectators owning the fighters
+        val winOwner = if (winnerSlot == 1) p1OwnerUser else p2OwnerUser
+        val loseOwner = if (loserSlot == 1) p1OwnerUser else p2OwnerUser
+        if (if (winnerSlot == 1) p1IsRealViewer else p2IsRealViewer) {
+            val prof = getOrCreateProfile(winOwner, winnerChar.folder)
+            if (prof != null) {
+                prof.wins += 1
+                prof.streak += 1
+                prof.characterFolder = winnerChar.folder
+            }
+        }
+        if (if (loserSlot == 1) p1IsRealViewer else p2IsRealViewer) {
+            val prof = getOrCreateProfile(loseOwner, (if (loserSlot == 1) currentP1 else currentP2).folder)
+            if (prof != null) {
+                prof.losses += 1
+                prof.streak = 0
+            }
+        }
+        saveSpectatorProfiles()
 
         if (winnerChar.folder.equals(kingWarriorFolder, ignoreCase = true) && winnerSlot == kingTeam) {
             winStreak++
@@ -696,39 +998,68 @@ class TikTokLiveManager(
             winStreak = 1
         }
 
-        // Determine next matchup: King stays (or P1 stays in Streamer vs Chat), opponent comes from challengerQueue
-        var nextP1 = if (playStyle == TikTokPlayStyle.STREAMER_VS_CHAT || winnerSlot == 1) currentP1 else currentP2
-        var nextP2 = if (playStyle == TikTokPlayStyle.STREAMER_VS_CHAT) currentP2 else currentP2
+        // Look for any waiting spectator in challengerQueue
+        val nextReq = challengerQueue.firstOrNull {
+            playStyle != TikTokPlayStyle.STREAMER_VS_CHAT || it.team == 2
+        }?.also { challengerQueue.remove(it) }
 
-        val queuedP1 = challengerQueue.firstOrNull { it.team == 1 }
-        val queuedP2 = challengerQueue.firstOrNull { it.team == 2 }
+        val nextP1: CharDefinition
+        val nextP2: CharDefinition
 
         if (playStyle == TikTokPlayStyle.STREAMER_VS_CHAT) {
             nextP1 = currentP1
-            if (queuedP2 != null) {
-                challengerQueue.remove(queuedP2)
-                nextP2 = queuedP2.character
+            if (nextReq != null) {
+                nextP2 = nextReq.character
+                p2OwnerUser = nextReq.requestedBy
+                p2IsRealViewer = true
+                waitingForChallenger = false
+                speakTts("¡Victoria! Ahora entra ${spokenName(nextReq.requestedBy)} con ${nextP2.name} contra el streamer!", flush = true)
             } else {
+                p2IsRealViewer = false
+                p2OwnerUser = "@Esperando_Retador"
+                waitingForChallenger = true
+                waitingLoserSlot = 2
+                waitingTimerSec = 30.0
+                ttsCheerTimer = 11.0
                 nextP2 = pickRandomChallenger(exclude = nextP1)
+                speakTts("¡Se cayó el retador! Escribe el nombre de tu personaje en el chat para pelear ahora!", flush = true)
             }
         } else {
-            // AUTO_ARENA King of the Hill
-            if (winnerSlot == 1) {
-                nextP1 = winnerChar
-                if (queuedP2 != null) {
-                    challengerQueue.remove(queuedP2)
-                    nextP2 = queuedP2.character
+            if (nextReq != null) {
+                waitingForChallenger = false
+                waitingTimerSec = 0.0
+                if (winnerSlot == 1) {
+                    nextP1 = winnerChar
+                    nextP2 = nextReq.character
+                    p2OwnerUser = nextReq.requestedBy
+                    p2IsRealViewer = true
                 } else {
-                    nextP2 = pickRandomChallenger(exclude = nextP1)
+                    nextP2 = winnerChar
+                    nextP1 = nextReq.character
+                    p1OwnerUser = nextReq.requestedBy
+                    p1IsRealViewer = true
                 }
+                userTeams[nextReq.requestedBy] = loserSlot
+                spectatorProfiles[profileKey(nextReq.requestedBy)]?.preferredTeam = loserSlot
+                speakTts("¡Gana ${spokenName(winOwner)} con ${winnerChar.name}! Siguiente retador: ${spokenName(nextReq.requestedBy)} con ${nextReq.character.name}!", flush = true)
             } else {
-                nextP2 = winnerChar
-                if (queuedP1 != null) {
-                    challengerQueue.remove(queuedP1)
-                    nextP1 = queuedP1.character
+                // No queued spectator -> invite viewers to type their fighter name in chat!
+                waitingForChallenger = true
+                waitingLoserSlot = loserSlot
+                waitingTimerSec = 30.0
+                ttsCheerTimer = 11.0
+                if (winnerSlot == 1) {
+                    nextP1 = winnerChar
+                    nextP2 = pickRandomChallenger(exclude = nextP1)
+                    p2IsRealViewer = false
+                    p2OwnerUser = "@Escribe_Tu_Personaje"
                 } else {
+                    nextP2 = winnerChar
                     nextP1 = pickRandomChallenger(exclude = nextP2)
+                    p1IsRealViewer = false
+                    p1OwnerUser = "@Escribe_Tu_Personaje"
                 }
+                speakTts("¡Gana ${spokenName(winOwner)} con ${winnerChar.name}! ¡El perdedor cayó! Escribe el nombre de tu personaje en el chat para entrar a pelear!", flush = true)
             }
         }
 
@@ -754,24 +1085,122 @@ class TikTokLiveManager(
         return if (pool.isNotEmpty()) pool.random() else characters.first()
     }
 
-    private fun tryQueueChallenger(team: Int, query: String, username: String, isSpanish: Boolean) {
+    private fun tryQueueChallenger(
+        team: Int,
+        query: String,
+        username: String,
+        isSpanish: Boolean,
+        explicitCommand: Boolean = true
+    ) {
         val ch = findCharacterByQuery(query)
         if (ch != null) {
-            enqueueChallenger(team, ch, username, isSpanish)
+            claimOrQueueCharacter(username, ch, preferredSlot = team, explicitCommand = explicitCommand, isSpanish = isSpanish)
         } else {
             pushFeed(team, username, if (isSpanish) "No se encontró '$query'" else "Fighter '$query' not found")
         }
     }
 
+    private fun claimOrQueueCharacter(
+        username: String,
+        ch: CharDefinition,
+        preferredSlot: Int,
+        explicitCommand: Boolean,
+        isSpanish: Boolean
+    ) {
+        val prof = getOrCreateProfile(username, ch.folder)
+        if (prof != null) {
+            prof.characterFolder = ch.folder
+        }
+
+        // Case 1: Post-KO "Waiting for Challenger" -> start match immediately!
+        if (waitingForChallenger) {
+            val slot = waitingLoserSlot
+            waitingForChallenger = false
+            waitingTimerSec = 0.0
+            if (slot == 1) {
+                p1OwnerUser = username
+                p1IsRealViewer = true
+            } else {
+                p2OwnerUser = username
+                p2IsRealViewer = true
+            }
+            userTeams[username] = slot
+            prof?.preferredTeam = slot
+            saveSpectatorProfiles()
+            pendingImmediateSpawn = ChallengerRequest(slot, ch, username)
+            val winsTag = if ((prof?.wins ?: 0) > 0) " (${prof?.wins}V)" else ""
+            pushFeed(slot, username, if (isSpanish) "⚔️ ¡ENTRA A PELEAR$winsTag con ${ch.name}!" else "⚔️ ENTERS FIGHT with ${ch.name}!")
+            showAlert(
+                slot,
+                username,
+                if (isSpanish) "⚔️ ¡RETADOR ENTRA!" else "⚔️ CHALLENGER ENTERS!",
+                "$username -> ${ch.name}$winsTag",
+                null,
+                2.8
+            )
+            speakTts("¡Atención! ${spokenName(username)} escribió ${ch.name} y entra a la arena! ¡Que comience la pelea!", flush = true)
+            return
+        }
+
+        // Case 2: Open bot slot while match is running and user typed character name directly
+        val hasOpenSlot = !p1IsRealViewer || !p2IsRealViewer
+        if (!explicitCommand && hasOpenSlot && !isAlreadyActivePlayer(username)) {
+            val openSlot = when {
+                playStyle == TikTokPlayStyle.STREAMER_VS_CHAT -> 2
+                preferredSlot == 1 && !p1IsRealViewer -> 1
+                preferredSlot == 2 && !p2IsRealViewer -> 2
+                !p1IsRealViewer -> 1
+                else -> 2
+            }
+            if (openSlot == 1) {
+                p1OwnerUser = username
+                p1IsRealViewer = true
+            } else {
+                p2OwnerUser = username
+                p2IsRealViewer = true
+            }
+            userTeams[username] = openSlot
+            prof?.preferredTeam = openSlot
+            saveSpectatorProfiles()
+            pendingImmediateSpawn = ChallengerRequest(openSlot, ch, username)
+            pushFeed(openSlot, username, if (isSpanish) "🎮 ¡Toma J$openSlot con ${ch.name}!" else "🎮 Claims P$openSlot with ${ch.name}!")
+            showAlert(
+                openSlot,
+                username,
+                if (isSpanish) "🎮 ¡JUGADOR J$openSlot LISTO!" else "🎮 PLAYER P$openSlot READY!",
+                "$username -> ${ch.name}",
+                null,
+                2.6
+            )
+            speakTts("¡${spokenName(username)} entra como jugador con ${ch.name}!", flush = true)
+            return
+        }
+
+        // Case 3: Both players already real viewers -> update own saved char if already fighting, or queue challenger
+        if (!explicitCommand && isAlreadyActivePlayer(username)) {
+            saveSpectatorProfiles()
+            val slot = if (username.equals(p1OwnerUser, true)) 1 else 2
+            pushFeed(slot, username, if (isSpanish) "💾 Guardó ${ch.name} en su perfil" else "💾 Saved ${ch.name}")
+            return
+        }
+
+        val queueSlot = if (preferredSlot in 1..2) preferredSlot else resolveOrAssignUserTeam(username)
+        prof?.preferredTeam = queueSlot
+        saveSpectatorProfiles()
+        enqueueChallenger(queueSlot, ch, username, isSpanish)
+    }
+
     private fun enqueueChallenger(team: Int, ch: CharDefinition, username: String, isSpanish: Boolean) {
+        challengerQueue.removeAll { it.requestedBy.equals(username, ignoreCase = true) }
         if (challengerQueue.size < 12) {
             challengerQueue.add(ChallengerRequest(team, ch, username))
             val teamLabel = if (team == 1) "J1" else "J2"
             pushFeed(
                 team,
                 username,
-                if (isSpanish) "Pide retador $teamLabel: ${ch.name}" else "Queued $teamLabel challenger: ${ch.name}"
+                if (isSpanish) "En cola ($teamLabel): ${ch.name}" else "Queued ($teamLabel): ${ch.name}"
             )
+            speakTts("¡${spokenName(username)} se anota con ${ch.name} para retar al ganador!", flush = false)
         }
     }
 

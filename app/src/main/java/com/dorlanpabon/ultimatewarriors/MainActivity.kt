@@ -85,6 +85,11 @@ class MainActivity : Activity() {
         val savedKey = prefs.getString("euler_api_key", TikTokLiveManager.DEFAULT_EULER_API_KEY)
         mgr.eulerApiKey = if (!savedKey.isNullOrBlank()) savedKey else TikTokLiveManager.DEFAULT_EULER_API_KEY
         mgr.autoDisableSimOnRealEvent = prefs.getBoolean("auto_disable_sim", true)
+        mgr.ttsEnabled = prefs.getBoolean("tts_enabled", true)
+        mgr.importSpectatorProfilesJson(prefs.getString("spectator_profiles_json", ""))
+        mgr.onSaveSpectatorProfiles = { json ->
+            prefs.edit().putString("spectator_profiles_json", json).apply()
+        }
 
         mgr.onRequestPhoneConnectDialog = {
             runOnUiThread { showTikTokPhoneDialog() }

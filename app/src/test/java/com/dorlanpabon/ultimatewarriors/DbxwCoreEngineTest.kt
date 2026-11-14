@@ -387,4 +387,70 @@ class DbxwCoreEngineTest {
         assertEquals(2L, mgr.totalCoins)
         assertEquals(feedBeforeDup, mgr.feedItems.size)
     }
+
+    @Test
+    fun spectatorPlayersJoinByCharNamePersistAndSupportByGiftsWork() {
+        val goku = characters.first { it.folder == "Goku" }
+        val broly = characters.first { it.folder == "Broly" }
+        val namek = stages.first()
+        val engine = DbxwCoreEngine(goku, broly, namek, GameSettings())
+        val ttsMessages = mutableListOf<String>()
+        var savedJson = ""
+        val mgr = TikTokLiveManager(characters, stages).apply {
+            eulerStreamEnabled = false
+            playStyle = TikTokPlayStyle.AUTO_ARENA
+            onSpeakTts = { txt, _ -> ttsMessages.add(txt) }
+            onSaveSpectatorProfiles = { json -> savedJson = json }
+        }
+
+        // 1. Two spectators claim P1 & P2 directly by typing character names in chat
+        mgr.enqueueChat("@carlos", "quiero pelear con goku")
+        mgr.processPendingEvents(engine, isSpanish = true)
+        assertTrue(mgr.p1IsRealViewer)
+        assertEquals("@carlos", mgr.p1OwnerUser)
+        assertEquals("Goku", mgr.pendingImmediateSpawn?.character?.folder)
+        assertEquals(1, mgr.pendingImmediateSpawn?.team)
+        mgr.pendingImmediateSpawn = null
+
+        mgr.enqueueChat("@maria", "broly")
+        mgr.processPendingEvents(engine, isSpanish = true)
+        assertTrue(mgr.p2IsRealViewer)
+        assertEquals("@maria", mgr.p2OwnerUser)
+        assertEquals("Broly", mgr.pendingImmediateSpawn?.character?.folder)
+        assertEquals(2, mgr.pendingImmediateSpawn?.team)
+        mgr.pendingImmediateSpawn = null
+
+        // Profiles persist in JSON and reload into a fresh manager
+        assertTrue(savedJson.contains("carlos") && savedJson.contains("maria"))
+        val reloaded = TikTokLiveManager(characters, stages)
+        reloaded.importSpectatorProfilesJson(savedJson)
+        assertEquals("Goku", reloaded.getOrCreateProfile("@carlos")?.characterFolder)
+        assertEquals("Broly", reloaded.getOrCreateProfile("@maria")?.characterFolder)
+
+        // 2. Sending gifts without explicit teamOverride supports that spectator's fighter
+        val p1ChargeBefore = engine.p1.chargeWidth
+        val p2ChargeBefore = engine.p2.chargeWidth
+        mgr.enqueueGift("@carlos", "rose", 1, 1)
+        mgr.enqueueGift("@maria", "rose", 1, 1)
+        mgr.processPendingEvents(engine, isSpanish = true)
+        assertTrue("Expected @carlos Rose to boost P1 charge", engine.p1.chargeWidth > p1ChargeBefore)
+        assertTrue("Expected @maria Rose to boost P2 charge", engine.p2.chargeWidth > p2ChargeBefore)
+
+        // 3. After KO with no queue, arena waits for challenger and accepts next spectator typing a character
+        engine.winnerPlayer = 1
+        engine.matchFinished = true
+        mgr.handleMatchFinished(engine, goku, broly, namek)
+        assertTrue(mgr.waitingForChallenger)
+        assertEquals(2, mgr.waitingLoserSlot)
+        assertEquals(1, mgr.getOrCreateProfile("@carlos")?.wins)
+        assertEquals(0, mgr.getOrCreateProfile("@maria")?.streak)
+
+        mgr.enqueueChat("@diego", "jiren")
+        mgr.processPendingEvents(engine, isSpanish = true)
+        assertFalse(mgr.waitingForChallenger)
+        assertEquals("@diego", mgr.p2OwnerUser)
+        assertEquals("Jiren", mgr.pendingImmediateSpawn?.character?.folder)
+        assertEquals(2, mgr.pendingImmediateSpawn?.team)
+        assertTrue("Expected TTS announcements during join, gifts and KO", ttsMessages.size >= 4)
+    }
 }
